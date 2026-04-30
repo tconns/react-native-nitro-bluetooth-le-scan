@@ -4,6 +4,7 @@ export interface NitroBleScan
   extends HybridObject<{ ios: 'swift'; android: 'kotlin' }> {
   getAdapterState(): string
   ensurePermissions(): boolean
+  setBluetoothEnabled(enable: boolean): boolean
   startScan(configJson: string): boolean
   stopScan(): boolean
   connect(deviceId: string, optionsJson: string): boolean

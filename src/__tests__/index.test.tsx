@@ -3,6 +3,7 @@ jest.mock('react-native-nitro-modules', () => ({
     createHybridObject: () => ({
       getAdapterState: () => 'poweredOn',
       ensurePermissions: () => true,
+      setBluetoothEnabled: () => true,
       startScan: () => true,
       stopScan: () => true,
       connect: () => true,
@@ -22,6 +23,9 @@ describe('react-native-nitro-bluetooth-le-scan', () => {
     const mod = require('../index')
     expect(typeof mod.startBleScan).toBe('function')
     expect(typeof mod.stopBleScan).toBe('function')
+    expect(typeof mod.enableBleAdapter).toBe('function')
+    expect(typeof mod.disableBleAdapter).toBe('function')
+    expect(typeof mod.setBleAdapterEnabled).toBe('function')
     expect(typeof mod.getBleScanSnapshot).toBe('function')
     expect(typeof mod.subscribeBleScan).toBe('function')
     expect(typeof mod.rankDevices).toBe('function')
@@ -33,6 +37,9 @@ describe('react-native-nitro-bluetooth-le-scan', () => {
     expect(typeof mod.safeConnect).toBe('function')
     expect(typeof mod.readWithRetry).toBe('function')
     expect(typeof mod.createNotificationManager).toBe('function')
+    expect(typeof mod.useBleScan).toBe('function')
+    expect(typeof mod.useBleAdapterState).toBe('function')
+    expect(typeof mod.useBlePermissions).toBe('function')
   })
 
   it('ranks stronger signal device first', () => {
@@ -151,5 +158,53 @@ describe('react-native-nitro-bluetooth-le-scan', () => {
     expect(report.connection.timeouts).toBe(1)
     expect(report.connection.gattOpSuccessRate).toBe(1)
     expect(trace.length).toBeGreaterThan(0)
+  })
+
+  it('supports idempotent notification manager clear', async () => {
+    const mod = require('../index')
+    const manager = mod.createNotificationManager()
+    let unsubCalls = 0
+    const adapter = {
+      subscribeNotification: async () => () => {
+        unsubCalls += 1
+      },
+    }
+    const address = {deviceId: 'd2', serviceUuid: 's2', characteristicUuid: 'c2'}
+    await manager.subscribe(adapter, address, () => undefined)
+    manager.clear()
+    manager.clear()
+    expect(unsubCalls).toBe(1)
+  })
+
+  it('times out operations with explicit timeout helper', async () => {
+    const mod = require('../index')
+    await expect(
+      mod.withTimeout(
+        new Promise((resolve) => setTimeout(resolve, 30)),
+        5,
+        'slow-op'
+      )
+    ).rejects.toThrow('slow-op timed out after 5ms')
+  })
+
+  it('retries operation and succeeds on a later attempt', async () => {
+    const mod = require('../index')
+    let attempts = 0
+    const result = await mod.withRetry(async () => {
+      attempts += 1
+      if (attempts < 3) {
+        throw new Error(`attempt-${attempts}-failed`)
+      }
+      return 'ok'
+    }, {maxAttempts: 3, initialDelayMs: 1, maxDelayMs: 2})
+    expect(result).toBe('ok')
+    expect(attempts).toBe(3)
+  })
+
+  it('exposes pending operation counters in snapshot', async () => {
+    const mod = require('../index')
+    const snapshot = mod.getBleScanSnapshot()
+    expect(typeof snapshot.pendingOperationCount).toBe('number')
+    expect(typeof snapshot.pendingOperationDeviceCount).toBe('number')
   })
 })

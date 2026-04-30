@@ -28,7 +28,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -63,6 +65,10 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private val notifyResultByKey = ConcurrentHashMap<String, Boolean>()
   private val connectTokenByDeviceId = ConcurrentHashMap<String, Long>()
   private val operationScheduler = Executors.newSingleThreadScheduledExecutor()
+  private val isShuttingDown = AtomicBoolean(false)
+  private var deviceEventCounter = 0
+  private val maxTrackedDevices = 512
+  private val cacheTtlMs = 120_000L
   private val classicReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: android.content.Context?, intent: Intent?) {
       try {
@@ -146,6 +152,32 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   }
 
   override fun ensurePermissions(): Boolean = hasScanPermission()
+
+  override fun setBluetoothEnabled(enable: Boolean): Boolean {
+    val adapter = bluetoothManager.adapter ?: return false
+    if (!hasScanPermission()) {
+      emitWarning(
+        "BLE_PERMISSION_DENIED",
+        "Missing Bluetooth permission for adapter state change.",
+        "Grant permission then retry."
+      )
+      return false
+    }
+    return try {
+      if (enable) {
+        if (adapter.isEnabled) true else adapter.enable()
+      } else {
+        if (!adapter.isEnabled) true else adapter.disable()
+      }
+    } catch (error: Throwable) {
+      emitWarning(
+        "BLE_ADAPTER_TOGGLE_FAILED",
+        "Failed to toggle Bluetooth adapter.",
+        "Use system Bluetooth settings.",
+      )
+      false
+    }
+  }
 
   override fun startScan(configJson: String): Boolean {
     synchronized(stateLock) {
@@ -255,31 +287,28 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       gattByDeviceId[deviceId] = gatt
       val token = nowMs()
       connectTokenByDeviceId[deviceId] = token
-      operationScheduler.schedule({
-        synchronized(stateLock) {
-          val stillSameAttempt = connectTokenByDeviceId[deviceId] == token
-          val stillConnecting = connectionStateByDeviceId[deviceId] == "connecting"
-          if (!stillSameAttempt || !stillConnecting) return@synchronized
-          connectTokenByDeviceId.remove(deviceId)
-          connectionStateByDeviceId[deviceId] = "disconnected"
-          emitConnectionState(deviceId, "disconnected")
-          gattByDeviceId.remove(deviceId)?.let { pendingGatt ->
-            try {
-              pendingGatt.disconnect()
-            } catch (_: Throwable) {
-              // no-op
-            }
-            try {
-              pendingGatt.close()
-            } catch (_: Throwable) {
-              // no-op
-            }
+      try {
+        operationScheduler.schedule({
+          synchronized(stateLock) {
+            val stillSameAttempt = connectTokenByDeviceId[deviceId] == token
+            val stillConnecting = connectionStateByDeviceId[deviceId] == "connecting"
+            if (!stillSameAttempt || !stillConnecting) return@synchronized
+            closeGattForDevice(deviceId)
+            clearDeviceState(deviceId)
+            connectionStateByDeviceId[deviceId] = "disconnected"
+            emitConnectionState(deviceId, "disconnected")
+            emitError("BLE_CONNECT_TIMEOUT", "Connect timed out for $deviceId.", "Retry or move closer to peripheral.")
           }
-          emitError("BLE_CONNECT_TIMEOUT", "Connect timed out for $deviceId.", "Retry or move closer to peripheral.")
-        }
-      }, timeoutMs, TimeUnit.MILLISECONDS)
+        }, timeoutMs, TimeUnit.MILLISECONDS)
+      } catch (_: RejectedExecutionException) {
+        closeGattForDevice(deviceId)
+        clearDeviceState(deviceId)
+        return false
+      }
       true
     } catch (error: Throwable) {
+      closeGattForDevice(deviceId)
+      clearDeviceState(deviceId)
       emitError("BLE_CONNECT_FAILED", "Failed to connect $deviceId.", "Retry connection.", error.message)
       false
     }
@@ -287,14 +316,19 @@ class NitroBleScan : HybridNitroBleScanSpec() {
 
   override fun disconnect(deviceId: String): Boolean {
     synchronized(stateLock) {
-      val gatt = gattByDeviceId[deviceId] ?: return true
+      val gatt = gattByDeviceId[deviceId]
       return try {
         connectionStateByDeviceId[deviceId] = "disconnecting"
         emitConnectionState(deviceId, "disconnecting")
-        gatt.disconnect()
-        gatt.close()
-        gattByDeviceId.remove(deviceId)
-        serviceCacheByDeviceId.remove(deviceId)
+        if (gatt != null) {
+          try {
+            gatt.disconnect()
+          } catch (_: Throwable) {
+            // no-op
+          }
+        }
+        closeGattForDevice(deviceId)
+        clearDeviceState(deviceId)
         connectionStateByDeviceId[deviceId] = "disconnected"
         emitConnectionState(deviceId, "disconnected")
         true
@@ -440,6 +474,8 @@ class NitroBleScan : HybridNitroBleScanSpec() {
         connectTokenByDeviceId.remove(deviceId)
         connectionStateByDeviceId[deviceId] = "disconnected"
         emitConnectionState(deviceId, "disconnected")
+        closeGattForDevice(deviceId)
+        clearDeviceState(deviceId)
         connectLatchByDeviceId.remove(deviceId)?.countDown()
       }
     }
@@ -623,6 +659,7 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       val serviceData = extractServiceData(result)
       val fingerprint = buildFingerprint(deviceId, manufacturerBytes, serviceUuids)
       val dedupeKey = if (dedupeMode == "fingerprint") fingerprint else deviceId
+      maybePruneScanCaches(now)
       val lastSeen = lastSeenById[dedupeKey]
       if (lastSeen != null && now - lastSeen < coalescingWindowMs) {
         snapshot.coalescedCount += 1
@@ -679,6 +716,7 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       val now = nowMs()
       val fingerprint = buildFingerprint(deviceId, emptyList(), emptyList())
       val dedupeKey = if (dedupeMode == "fingerprint") fingerprint else deviceId
+      maybePruneScanCaches(now)
       val lastSeen = lastSeenById[dedupeKey]
       if (lastSeen != null && now - lastSeen < coalescingWindowMs) {
         snapshot.coalescedCount += 1
@@ -825,6 +863,79 @@ class NitroBleScan : HybridNitroBleScanSpec() {
 
   private fun characteristicKey(address: CharacteristicAddress): String {
     return "${address.deviceId}|${address.serviceUuid}|${address.characteristicUuid}"
+  }
+
+  private fun closeGattForDevice(deviceId: String) {
+    val gatt = gattByDeviceId.remove(deviceId) ?: return
+    try {
+      gatt.disconnect()
+    } catch (_: Throwable) {
+      // no-op
+    }
+    try {
+      gatt.close()
+    } catch (_: Throwable) {
+      // no-op
+    }
+  }
+
+  private fun clearOperationStateForDevice(deviceId: String) {
+    val prefix = "$deviceId|"
+    readLatchByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
+      readLatchByKey.remove(key)
+      readValueByKey.remove(key)
+    }
+    writeLatchByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
+      writeLatchByKey.remove(key)
+      writeResultByKey.remove(key)
+    }
+    notifyLatchByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
+      notifyLatchByKey.remove(key)
+      notifyResultByKey.remove(key)
+    }
+  }
+
+  private fun clearDeviceState(deviceId: String) {
+    connectTokenByDeviceId.remove(deviceId)
+    connectLatchByDeviceId.remove(deviceId)
+    discoverLatchByDeviceId.remove(deviceId)
+    serviceCacheByDeviceId.remove(deviceId)
+    clearOperationStateForDevice(deviceId)
+  }
+
+  private fun maybePruneScanCaches(now: Long) {
+    deviceEventCounter += 1
+    if (deviceEventCounter % 128 != 0 && lastSeenById.size <= maxTrackedDevices) return
+    val staleKeys =
+      lastSeenById.entries
+        .filter { entry -> now - entry.value > cacheTtlMs }
+        .map { it.key }
+    staleKeys.forEach { key -> lastSeenById.remove(key) }
+    if (lastSeenById.size > maxTrackedDevices) {
+      val oldest =
+        lastSeenById.entries
+          .sortedBy { it.value }
+          .take(lastSeenById.size - maxTrackedDevices)
+      oldest.forEach { entry -> lastSeenById.remove(entry.key) }
+    }
+    if (rssiHistoryById.size > maxTrackedDevices) {
+      val overflow = rssiHistoryById.keys.take(rssiHistoryById.size - maxTrackedDevices)
+      overflow.forEach { key -> rssiHistoryById.remove(key) }
+    }
+  }
+
+  private fun shutdownModuleResources() {
+    if (!isShuttingDown.compareAndSet(false, true)) return
+    try {
+      operationScheduler.shutdownNow()
+    } catch (_: Throwable) {
+      // no-op
+    }
+    gattByDeviceId.keys.toList().forEach { deviceId ->
+      closeGattForDevice(deviceId)
+      clearDeviceState(deviceId)
+    }
+    connectionStateByDeviceId.clear()
   }
 
   private fun buildScanSettings(configJson: String): ScanSettings {
@@ -1103,6 +1214,7 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       scanner = null
       snapshot.isScanning = false
       listener = null
+      shutdownModuleResources()
     }
   }
 }

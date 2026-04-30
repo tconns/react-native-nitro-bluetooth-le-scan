@@ -45,6 +45,7 @@ const parserRegistry = new Map<string, ManufacturerParser>([
 ])
 
 let lastConfig: BleScanConfig = {}
+const operationTailByDeviceId = new Map<string, Promise<unknown>>()
 
 const clamp = (value: number, min = 0, max = 1) =>
   Math.max(min, Math.min(max, value))
@@ -119,6 +120,23 @@ function parseJson<T>(value: string, fallback: T): T {
   }
 }
 
+async function enqueueByDevice<T>(
+  deviceId: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const previous = operationTailByDeviceId.get(deviceId) ?? Promise.resolve()
+  const next = previous.catch(() => undefined).then(operation)
+  operationTailByDeviceId.set(
+    deviceId,
+    next.finally(() => {
+      if (operationTailByDeviceId.get(deviceId) === next) {
+        operationTailByDeviceId.delete(deviceId)
+      }
+    })
+  )
+  return next
+}
+
 let listenerAttached = false
 function ensureListenerAttached() {
   if (listenerAttached) return
@@ -152,6 +170,16 @@ export const bleScanManager: BleScanManager = {
   async ensurePermissions() {
     return native.ensurePermissions()
   },
+  async setBluetoothEnabled(enable) {
+    ensureListenerAttached()
+    return native.setBluetoothEnabled(enable)
+  },
+  async enableBluetooth() {
+    return bleScanManager.setBluetoothEnabled(true)
+  },
+  async disableBluetooth() {
+    return bleScanManager.setBluetoothEnabled(false)
+  },
   async startScan(config = {}) {
     ensureListenerAttached()
     lastConfig = config
@@ -162,25 +190,40 @@ export const bleScanManager: BleScanManager = {
   },
   async connect(deviceId, options = {}) {
     ensureListenerAttached()
-    return native.connect(deviceId, JSON.stringify(options))
+    return enqueueByDevice(deviceId, async () =>
+      native.connect(deviceId, JSON.stringify(options))
+    )
   },
   async disconnect(deviceId) {
-    return native.disconnect(deviceId)
+    return enqueueByDevice(deviceId, async () => native.disconnect(deviceId))
   },
   async discoverServices(deviceId) {
-    return parseJson<BleGattService[]>(native.discoverServices(deviceId), [])
+    return enqueueByDevice(deviceId, async () =>
+      parseJson<BleGattService[]>(native.discoverServices(deviceId), [])
+    )
   },
   async readCharacteristic(address) {
-    return parseJson<number[]>(native.readCharacteristic(JSON.stringify(address)), [])
+    return enqueueByDevice(address.deviceId, async () =>
+      parseJson<number[]>(native.readCharacteristic(JSON.stringify(address)), [])
+    )
   },
   async writeCharacteristic(address, value) {
-    return native.writeCharacteristic(JSON.stringify(address), JSON.stringify(value))
+    return enqueueByDevice(address.deviceId, async () =>
+      native.writeCharacteristic(JSON.stringify(address), JSON.stringify(value))
+    )
   },
   async setCharacteristicNotification(address, enable) {
-    return native.setCharacteristicNotification(JSON.stringify(address), enable)
+    return enqueueByDevice(address.deviceId, async () =>
+      native.setCharacteristicNotification(JSON.stringify(address), enable)
+    )
   },
   getSnapshot() {
-    return parseJson(native.getSnapshot(), FALLBACK_SNAPSHOT)
+    const snapshot = parseJson(native.getSnapshot(), FALLBACK_SNAPSHOT)
+    return {
+      ...snapshot,
+      pendingOperationCount: operationTailByDeviceId.size,
+      pendingOperationDeviceCount: operationTailByDeviceId.size,
+    }
   },
   subscribe(listener) {
     ensureListenerAttached()
@@ -191,6 +234,10 @@ export const bleScanManager: BleScanManager = {
 
 export const getBleAdapterState = () => bleScanManager.getAdapterState()
 export const ensureBleScanPermissions = () => bleScanManager.ensurePermissions()
+export const setBleAdapterEnabled = (enable: boolean) =>
+  bleScanManager.setBluetoothEnabled(enable)
+export const enableBleAdapter = () => bleScanManager.enableBluetooth()
+export const disableBleAdapter = () => bleScanManager.disableBluetooth()
 export const startBleScan = (config?: BleScanConfig) => bleScanManager.startScan(config)
 export const stopBleScan = () => bleScanManager.stopScan()
 export const connectBleDevice = (

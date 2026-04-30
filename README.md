@@ -1,18 +1,40 @@
 # react-native-nitro-bluetooth-le-scan
 
-Nitro-powered BLE scanner for React Native.
+Nitro-powered Bluetooth scanning and connection toolkit for React Native.
 
-`react-native-nitro-bluetooth-le-scan` provides a scan-first API with native Android/iOS execution, event streaming, and lightweight observability snapshots.
+`react-native-nitro-bluetooth-le-scan` helps teams ship Bluetooth features that survive real production traffic, permission edge cases, and platform differences. It combines native execution speed with a typed JS runtime, observability primitives, and practical DX tooling.
 
-## Highlights
+## Value In 30 Seconds
 
-- Nitro-first architecture (Android native + iOS native + JS facade)
-- Scan lifecycle API: start, stop, adapter state, permission check
-- Event stream with coalescing support
-- Device intelligence metadata: `smoothedRssi`, `score`, `fingerprint`
-- Distance/ranking helpers and manufacturer parser plugin hooks
-- Snapshot counters (`eventsEmitted`, `eventsDropped`, `coalescedCount`)
-- Unified error model with `code`, `message`, `recoveryHint`
+If you need React Native Bluetooth that is:
+
+- **stable** under noisy scan conditions,
+- **predictable** across Android/iOS,
+- **debuggable** with quality metrics and traces,
+- **extensible** for scanner, GATT, and product-specific workflows,
+
+this module is designed for that exact outcome.
+
+Design priority: `Reliability > Performance > API clarity > DX`.
+
+## Why This Is Different
+
+Most BLE integrations break at scale because they focus only on happy-path scanning. This library explicitly addresses:
+
+- permission and adapter-state complexity,
+- event storm/backpressure behavior,
+- connect/discover/read/write sequencing risks,
+- production incident debugging with insufficient telemetry.
+
+## Feature Matrix By Phase
+
+| Phase | Focus | What You Get |
+| --- | --- | --- |
+| 1 | Foundation scan | Lifecycle APIs, permissions/adapters, filter/coalescing, snapshot counters |
+| 2 | Device intelligence | RSSI smoothing, distance estimate, ranking, manufacturer parser plugins |
+| 3 | Connection-ready | Connect/disconnect, service discovery, read/write, notification toggles |
+| 4 | Hardening | Non-blocking connect, op queue, instrumentation, QA fault injection, health report + trace |
+| 5 | DX moat | React hooks, scaffold command, diagnostics command, cookbook recipes |
 
 ## Requirements
 
@@ -22,196 +44,505 @@ Nitro-powered BLE scanner for React Native.
 
 ## Installation
 
+### 1) Install dependencies
+
 ```bash
 npm install react-native-nitro-bluetooth-le-scan react-native-nitro-modules
 ```
+
+### 2) iOS pods
 
 ```bash
 cd ios && pod install
 ```
 
-## Platform permissions
+### 3) Configure native permission files (required)
+
+#### Android: edit `android/app/src/main/AndroidManifest.xml`
+
+Add these permissions inside `<manifest>`:
+
+```xml
+<uses-permission android:name="android.permission.BLUETOOTH" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+```
+
+Notes:
+
+- `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` are required on Android 12+.
+- `ACCESS_FINE_LOCATION` is required for Android <= 11 BLE scan behavior and classic discovery compatibility.
+
+#### iOS: edit `ios/<YourApp>/Info.plist`
+
+Add these keys:
+
+```xml
+<key>NSBluetoothAlwaysUsageDescription</key>
+<string>This app uses Bluetooth to discover and connect nearby devices.</string>
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>This app may use location to improve Bluetooth device discovery on older iOS flows.</string>
+```
+
+At minimum, `NSBluetoothAlwaysUsageDescription` is required.
+
+### 4) Request runtime permissions in app code
+
+In your app screen (for example `App.tsx`), request runtime permissions before `startBleScan()` on Android:
+
+```ts
+import {PermissionsAndroid, Platform} from 'react-native'
+
+async function requestBlePermissions() {
+  if (Platform.OS !== 'android') return true
+  if (Platform.Version >= 31) {
+    const result = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+    ])
+    return (
+      result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED &&
+      result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED &&
+      result[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED
+    )
+  }
+  const location = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+  )
+  return location === PermissionsAndroid.RESULTS.GRANTED
+}
+```
+
+### 5) Rebuild native app
+
+After adding a Nitro native module, always rebuild:
+
+```bash
+# Android
+npx react-native run-android
+
+# iOS
+npx react-native run-ios
+```
+
+### 6) Local tarball install (for module development)
+
+If you are iterating on this module locally and consuming it from another app:
+
+```bash
+# In module repo
+npm run typescript
+npm pack
+
+# In host app
+npm install ../react-native-nitro-bluetooth-le-scan/react-native-nitro-bluetooth-le-scan-<version>.tgz
+```
+
+### 7) Verify installation quickly
+
+- Module imports successfully in JS.
+- Android build can compile `:react-native-nitro-bluetooth-le-scan`.
+- iOS build links pod without missing symbols.
+- `getBleAdapterState()` returns a valid state string at runtime.
+
+## Platform Permissions
+
+This section is a quick reference. For exact setup, follow the Installation steps above where file paths and snippets are provided.
 
 ### Android
 
-- Runtime (Android 12+):
+- Android 12+ runtime:
   - `BLUETOOTH_SCAN`
   - `BLUETOOTH_CONNECT`
-- Runtime (Android <= 11):
+- Android <= 11 runtime:
   - `ACCESS_FINE_LOCATION`
-
-Library manifest already declares BLE-related permissions, but the host app is still responsible for runtime requests.
 
 ### iOS
 
-- Required Info.plist key:
+- Add to `Info.plist`:
   - `NSBluetoothAlwaysUsageDescription`
-- Runtime authorization is managed by CoreBluetooth.
 
-## Quickstart (5 minutes)
+The host app owns permission prompt timing and UX.
+
+### Recommended host manifest/plist setup
+
+Android (`AndroidManifest.xml`, app-level):
+
+- `BLUETOOTH`
+- `BLUETOOTH_ADMIN`
+- `BLUETOOTH_SCAN`
+- `BLUETOOTH_CONNECT`
+- `ACCESS_FINE_LOCATION` (for Android <= 11 flows and classic discovery compatibility)
+
+iOS (`Info.plist`):
+
+- `NSBluetoothAlwaysUsageDescription`
+- optional (if your app also requires location for product behavior): `NSLocationWhenInUseUsageDescription`
+
+## Quick Start Paths
+
+### Path A: First Scan In 5 Minutes
+
+Step flow:
+
+1. Ensure runtime permission.
+2. Verify adapter is `poweredOn`.
+3. Subscribe to events.
+4. Start scan.
+5. Stop scan and unsubscribe during cleanup.
 
 ```ts
 import {
-  estimateDistance,
   ensureBleScanPermissions,
   getBleAdapterState,
-  getBleScanSnapshot,
-  rankDevices,
-  registerManufacturerParser,
   startBleScan,
   stopBleScan,
   subscribeBleScan,
 } from 'react-native-nitro-bluetooth-le-scan'
 
-async function demo() {
+async function runBasicScan() {
   const granted = await ensureBleScanPermissions()
   if (!granted) return
-
-  const adapter = getBleAdapterState()
-  if (adapter !== 'poweredOn') return
+  if (getBleAdapterState() !== 'poweredOn') return
 
   const unsubscribe = subscribeBleScan((event) => {
     if (event.type === 'deviceFound') {
-      const distance = estimateDistance(event.payload.smoothedRssi ?? event.payload.rssi)
-      console.log('device', event.payload.id, event.payload.score, distance)
+      console.log('found', event.payload.id, event.payload.rssi)
     }
   })
 
-  registerManufacturerParser({
-    id: 'custom-parser',
-    canParse: (result) => (result.manufacturerData?.length ?? 0) > 0,
-    parse: (result) => ({preview: result.manufacturerData?.slice(0, 4)}),
-  })
-
-  await startBleScan({
-    mode: 'balanced',
-    allowDuplicates: false,
-    coalescingWindowMs: 150,
-    dedupeMode: 'fingerprint',
-    rssiSmoothingWindow: 5,
-    rankingWeights: {rssi: 0.6, recency: 0.25, connectable: 0.1, transport: 0.05},
-  })
+  await startBleScan({mode: 'balanced', allowDuplicates: false})
 
   setTimeout(async () => {
     await stopBleScan()
-    console.log(getBleScanSnapshot())
     unsubscribe()
   }, 5000)
 }
 ```
 
-## API
+### Path B: Connection-Ready Flow
 
-- `getBleAdapterState(): BleScanAdapterState`
-- `ensureBleScanPermissions(): Promise<boolean>`
-- `startBleScan(config?: BleScanConfig): Promise<boolean>`
-- `stopBleScan(): Promise<boolean>`
-- `getBleScanSnapshot(): BleScanSnapshot`
-- `subscribeBleScan(listener): unsubscribe`
-- `estimateDistance(rssi, model?): number`
-- `rankDevices(devices, weights?): BleScanResult[]`
-- `registerManufacturerParser(parser): void`
-- `unregisterManufacturerParser(parserId): void`
-- `createGattOperationQueue(): { enqueue(deviceId, op), clear(deviceId?) }`
-- `createInstrumentedConnectionAdapter(adapter, onMetric): BleConnectionAdapter`
-- `createFaultInjectionAdapter(adapter, policy): BleConnectionAdapter`
-- `createRuntimeHealthMonitor(): BleRuntimeHealthMonitor`
+Step flow:
 
-### Phase 4 utilities (operation safety + telemetry)
+1. Connect with timeout.
+2. Discover services.
+3. Read/write characteristics.
+4. Enable notifications where needed.
+5. Disconnect cleanly.
 
-Use queue + metrics to keep one in-flight GATT op per device and observe latency/failures:
+```ts
+import {
+  connectBleDevice,
+  discoverBleServices,
+  readBleCharacteristic,
+} from 'react-native-nitro-bluetooth-le-scan'
+
+const connected = await connectBleDevice(deviceId, {timeoutMs: 12000})
+if (!connected) throw new Error('connect failed')
+
+const services = await discoverBleServices(deviceId)
+console.log('services', services.length)
+
+const value = await readBleCharacteristic({
+  deviceId,
+  serviceUuid,
+  characteristicUuid,
+})
+```
+
+### Path C: Production-Safe Flow
+
+Use this in production apps where race safety and telemetry matter.
+
+Step flow:
+
+1. Serialize per-device GATT operations with queue.
+2. Instrument operation metrics.
+3. Feed metrics/events into health monitor.
+4. Persist report/trace in QA incident logs.
 
 ```ts
 import {
   createGattOperationQueue,
   createInstrumentedConnectionAdapter,
-  discoverServicesWithCache,
+  createRuntimeHealthMonitor,
 } from 'react-native-nitro-bluetooth-le-scan'
 
 const queue = createGattOperationQueue()
-const instrumented = createInstrumentedConnectionAdapter(adapter, (metric) => {
-  console.log('[ble-op]', metric.opName, metric.deviceId, metric.elapsedMs, metric.success)
-})
-
-await queue.enqueue(deviceId, () => instrumented.connect(deviceId))
-const services = await queue.enqueue(deviceId, () =>
-  discoverServicesWithCache(instrumented, deviceId)
-)
-```
-
-Inject deterministic failures/delays for QA:
-
-```ts
-import {createFaultInjectionAdapter} from 'react-native-nitro-bluetooth-le-scan'
-
-const qaAdapter = createFaultInjectionAdapter(adapter, {
-  connect: {failTimes: 1, failWith: 'simulated connect failure'},
-  discoverServices: {delayMs: 1200},
-})
-```
-
-Aggregate runtime quality for scan/connection sessions:
-
-```ts
-import {
-  createInstrumentedConnectionAdapter,
-  createRuntimeHealthMonitor,
-  subscribeBleScan,
-} from 'react-native-nitro-bluetooth-le-scan'
-
 const monitor = createRuntimeHealthMonitor()
+
 const instrumented = createInstrumentedConnectionAdapter(adapter, (metric) => {
   monitor.onGattMetric(metric)
 })
 
-const unsubscribe = subscribeBleScan((event) => monitor.onScanEvent(event))
-const report = monitor.getReport()
-const trace = monitor.getTrace(50) // latest 50 entries (scan events + gatt metrics)
-console.log(report.scan, report.connection)
-unsubscribe()
+await queue.enqueue(deviceId, () => instrumented.connect(deviceId))
 ```
 
-### Event types
+### Optional path: Hooks-first integration
+
+If your app architecture is React hook-centric, start with:
+
+```ts
+import {
+  useBleAdapterState,
+  useBlePermissions,
+  useBleScan,
+} from 'react-native-nitro-bluetooth-le-scan'
+
+function BleScreen() {
+  const {adapterState, refresh} = useBleAdapterState()
+  const {granted, ensure} = useBlePermissions()
+  const {isScanning, devices, start, stop} = useBleScan()
+
+  return null
+}
+```
+
+## API By Intent
+
+### Discover Devices
+
+- `getBleAdapterState()`
+- `ensureBleScanPermissions()`
+- `setBleAdapterEnabled(enable)`
+- `enableBleAdapter()`
+- `disableBleAdapter()`
+- `startBleScan(config?)`
+- `stopBleScan()`
+- `subscribeBleScan(listener)`
+- `getBleScanSnapshot()`
+
+### Prioritize and Enrich
+
+- `estimateDistance(rssi, model?)`
+- `rankDevices(devices, weights?)`
+- `registerManufacturerParser(parser)`
+- `unregisterManufacturerParser(parserId)`
+
+### Connect and Exchange Data
+
+- `connectBleDevice(deviceId, options?)`
+- `disconnectBleDevice(deviceId)`
+- `discoverBleServices(deviceId)`
+- `readBleCharacteristic(address)`
+- `writeBleCharacteristic(address, value)`
+- `setBleCharacteristicNotification(address, enable)`
+
+### Harden Runtime Behavior
+
+- `createGattOperationQueue()`
+- `createInstrumentedConnectionAdapter(adapter, onMetric)`
+- `createFaultInjectionAdapter(adapter, policy)`
+- `createRuntimeHealthMonitor()`
+
+### Build Faster (DX)
+
+- `useBleScan()`
+- `useBleAdapterState()`
+- `useBlePermissions()`
+- `npm run dx:scaffold`
+- `npm run dx:diagnostics`
+
+## Event and Error Contract
+
+Main events:
 
 - `scanStarted`
 - `scanStopped`
 - `deviceFound`
 - `adapterStateChanged`
+- `connectionStateChanged`
+- `servicesDiscovered`
+- `characteristicValueChanged`
 - `warning`
 - `error`
 
-## Troubleshooting
+Error payload shape:
 
-### `BLE_PERMISSION_DENIED`
+- `code`
+- `message`
+- `recoveryHint?`
+- `platformDetails?`
 
-- Ensure runtime permissions are requested before `startBleScan()`.
-- Re-check permissions after app resumes from Settings.
+## Observability Playbook
 
-### `BLE_ADAPTER_OFF`
+Aggregate runtime quality signals:
 
-- Turn on Bluetooth and retry.
-- Verify device/emulator has BLE support.
+```ts
+const monitor = createRuntimeHealthMonitor()
+const unsubscribe = subscribeBleScan((event) => monitor.onScanEvent(event))
 
-### iOS build issues
+const report = monitor.getReport()
+const trace = monitor.getTrace(50)
+```
 
-- Run `cd ios && pod install`.
-- Open `.xcworkspace` instead of `.xcodeproj`.
+Use `report` for health KPIs (attempts, failures, latency, warnings/errors) and `trace` for sequence-level incident evidence.
 
-## Development scripts
+Lifecycle hardening rules:
+
+- always keep and call unsubscribe function from `subscribeBleScan(...)` on screen unmount
+- always disconnect active devices before leaving a screen with GATT actions
+- always turn off notifications when no longer needed
+- collect `report + trace` in QA bug reports for connection/perf incidents
+
+## DX Commands
+
+### Scaffold a BLE screen
+
+```bash
+npm run dx:scaffold -- --name BleOperationsScreen --output ../react-native-codebase/src/screens
+```
+
+### Summarize diagnostics from JSON dumps
+
+```bash
+npm run dx:diagnostics -- --report ./tmp/ble-report.json --trace ./tmp/ble-trace.json
+```
+
+### Typical command workflow for app teams
+
+```bash
+# 1) Create starter screen
+npm run dx:scaffold -- --name BleDiagnosticsScreen --output ./src/screens
+
+# 2) During QA, export report/trace JSON from your app logic, then summarize
+npm run dx:diagnostics -- --report ./tmp/ble-report.json --trace ./tmp/ble-trace.json
+```
+
+## Cookbook
+
+Production recipes:
+
+- [BLE Cookbook](./docs/cookbook.md)
+
+Includes:
+
+- retail beacon discovery
+- IoT provisioning flow
+- wearable/medical monitoring
+- indoor proximity ranking
+
+## Troubleshooting By Symptom
+
+### Symptom: `BLE_PERMISSION_DENIED`
+
+Likely cause:
+
+- runtime permission not granted yet
+
+Fix now:
+
+- request permission before scan/connect
+- re-check after returning from OS settings
+
+### Symptom: `BLE_ADAPTER_OFF`
+
+Likely cause:
+
+- Bluetooth disabled or transitioning state
+
+Fix now:
+
+- prompt enable Bluetooth
+- refresh adapter state and retry
+- optionally try `enableBleAdapter()` on Android (best effort)
+
+### Symptom: `BLE_CONNECT_TIMEOUT`
+
+Likely cause:
+
+- weak signal/distance or peripheral not ready
+
+Fix now:
+
+- retry with backoff policy
+- inspect `monitor.getTrace()` timeline
+
+### Symptom: duplicate callbacks after navigating away
+
+Likely cause:
+
+- listener was not unsubscribed on unmount
+
+Fix now:
+
+- store unsubscribe callback returned by `subscribeBleScan`
+- invoke it in your component cleanup path
+
+### Symptom: stale connection state in UI
+
+Likely cause:
+
+- UI keeps local state but does not reconcile with `connectionStateChanged` events
+
+Fix now:
+
+- derive connection badges from emitted lifecycle events
+- clear local service/device cache when `disconnected` is emitted
+
+### Symptom: growing operation latency over long sessions
+
+Likely cause:
+
+- too many in-flight actions per device or missing per-device serialization
+
+Fix now:
+
+- run GATT operations through `createGattOperationQueue()`
+- inspect `pendingOperationCount` in snapshot and include it in diagnostics
+
+### Symptom: iOS build integration issues
+
+Fix now:
+
+- run `cd ios && pod install`
+- open `.xcworkspace` instead of `.xcodeproj`
+
+### Symptom: adapter toggle API returns false
+
+Likely cause:
+
+- iOS does not allow third-party apps to toggle Bluetooth programmatically.
+- Android may reject toggle on some OS/device policies.
+
+Fix now:
+
+- treat toggle API as best-effort helper
+- provide fallback UX to open system Bluetooth settings
+
+## Operational Readiness Checklist
+
+- [ ] typecheck, lint, tests all pass
+- [ ] generated specs are up to date
+- [ ] permission UX tested on Android 12+ and <=11 paths
+- [ ] physical-device scan/connect smoke tests passed
+- [ ] health report + trace capture validated during QA
+- [ ] Android/iOS demo integration build passed
+
+## Development
+
+Scripts:
 
 - `npm run typecheck`
 - `npm run lint`
 - `npm run specs`
 - `npm test`
+- `npm run dx:scaffold`
+- `npm run dx:diagnostics`
 
-## Release checklist (v0.1.0 baseline)
+## Acknowledgements
 
-- `npm run typecheck` passes
-- `npm run lint` passes
-- `npm run specs` regenerates cleanly
-- `npm test` passes
-- Android/iOS integration build passes in demo app
+Special thanks to the following projects that inspired this library:
+
+- [mrousavy/nitro](https://github.com/mrousavy/nitro) – Nitro Modules architecture
 
 ## License
 
 MIT
+
+<a href="https://www.buymeacoffee.com/tconns94" target="_blank">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="200"/>
+</a>

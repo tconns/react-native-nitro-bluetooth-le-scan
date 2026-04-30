@@ -100,11 +100,16 @@ export type BleScanSnapshot = {
   eventsDropped: number
   coalescedCount: number
   lastErrorCode?: string
+  pendingOperationCount?: number
+  pendingOperationDeviceCount?: number
 }
 
 export type BleScanManager = {
   getAdapterState: () => BleScanAdapterState
   ensurePermissions: () => Promise<boolean>
+  setBluetoothEnabled: (enable: boolean) => Promise<boolean>
+  enableBluetooth: () => Promise<boolean>
+  disableBluetooth: () => Promise<boolean>
   startScan: (config?: BleScanConfig) => Promise<boolean>
   stopScan: () => Promise<boolean>
   connect: (deviceId: string, options?: BleConnectionOptions) => Promise<boolean>

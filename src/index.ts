@@ -21,17 +21,20 @@ export type {
 } from './types'
 export {
   bleScanManager,
+  disableBleAdapter,
   connectBleDevice,
   disconnectBleDevice,
   discoverBleServices,
   estimateDistance,
   ensureBleScanPermissions,
+  enableBleAdapter,
   getBleAdapterState,
   getBleScanSnapshot,
   readBleCharacteristic,
   rankDevices,
   registerManufacturerParser,
   setBleCharacteristicNotification,
+  setBleAdapterEnabled,
   startBleScan,
   stopBleScan,
   subscribeBleScan,
@@ -68,3 +71,9 @@ export type {
   BleRuntimeTraceEntry,
   BleScanHealthSummary,
 } from './observability'
+export {useBleAdapterState, useBlePermissions, useBleScan} from './hooks'
+export type {
+  UseBleAdapterStateResult,
+  UseBlePermissionsResult,
+  UseBleScanResult,
+} from './hooks'

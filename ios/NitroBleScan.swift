@@ -104,6 +104,9 @@ class NitroBleScan: HybridNitroBleScanSpec {
   private var notifySemaphoreByKey: [String: DispatchSemaphore] = [:]
   private var notifyResultByKey: [String: Bool] = [:]
   private var stateLock = NSLock()
+  private var discoverOrder: [String] = []
+  private let maxTrackedPeripherals = 256
+  private let maxTrackedSeenDevices = 512
 
   private struct RankingWeights {
     var rssi = 0.6
@@ -130,6 +133,17 @@ class NitroBleScan: HybridNitroBleScanSpec {
     return true
   }
 
+  func setBluetoothEnabled(enable: Bool) -> Bool {
+    emitIssue(
+      type: "warning",
+      code: "BLE_ADAPTER_TOGGLE_UNSUPPORTED",
+      message: "Programmatic Bluetooth toggle is not supported on iOS third-party apps.",
+      recoveryHint: "Use iOS Settings or Control Center to change Bluetooth state.",
+      platformDetails: "requested=\(enable)"
+    )
+    return false
+  }
+
   func startScan(configJson: String) -> Bool {
     stateLock.lock()
     defer { stateLock.unlock() }
@@ -148,21 +162,14 @@ class NitroBleScan: HybridNitroBleScanSpec {
     }
 
     let config = parseConfig(configJson)
-    if config.enableClassicDiscovery == true {
-      emitIssue(
-        type: "warning",
-        code: "BLE_CLASSIC_UNSUPPORTED",
-        message: "Classic Bluetooth discovery is not available on iOS for third-party apps.",
-        recoveryHint: "Use BLE scan on iOS, and test classic discovery on Android.",
-        platformDetails: nil
-      )
-    }
     coalescingWindowMs = max(0, config.coalescingWindowMs ?? 150)
     dedupeMode = config.dedupeMode ?? "deviceId"
     rssiSmoothingWindow = min(max(config.rssiSmoothingWindow ?? 5, 1), 20)
     rankingWeights = config.rankingWeights ?? RankingWeights()
     seenDevices.removeAll()
     rssiHistory.removeAll()
+    discoveredPeripherals.removeAll()
+    discoverOrder.removeAll()
 
     var options: [String: Any] = [CBCentralManagerScanOptionAllowDuplicatesKey: config.allowDuplicates ?? false]
     if let solicited = config.serviceUuids, !solicited.isEmpty {
@@ -186,6 +193,10 @@ class NitroBleScan: HybridNitroBleScanSpec {
     centralManager.stopScan()
     isScanning = false
     lastStopTs = nowMs()
+    seenDevices.removeAll()
+    rssiHistory.removeAll()
+    discoveredPeripherals.removeAll()
+    discoverOrder.removeAll()
     emitSimpleEvent(type: "scanStopped", reason: "manualStop")
     return true
   }
@@ -227,9 +238,8 @@ class NitroBleScan: HybridNitroBleScanSpec {
       self.stateLock.lock()
       defer { self.stateLock.unlock() }
       guard self.connectionStateById[deviceId] == "connecting" else { return }
+      self.clearDeviceState(deviceId: deviceId)
       self.connectionStateById[deviceId] = "disconnected"
-      self.connectedPeripherals[deviceId] = nil
-      self.serviceCache[deviceId] = nil
       self.centralManager.cancelPeripheralConnection(peripheral)
       self.emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "disconnected"])
       self.emitIssue(
@@ -250,10 +260,6 @@ class NitroBleScan: HybridNitroBleScanSpec {
     connectionStateById[deviceId] = "disconnecting"
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "disconnecting"])
     centralManager.cancelPeripheralConnection(peripheral)
-    connectedPeripherals[deviceId] = nil
-    serviceCache[deviceId] = nil
-    connectionStateById[deviceId] = "disconnected"
-    emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "disconnected"])
     return true
   }
 
@@ -275,7 +281,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
     let waitResult = semaphore.wait(timeout: .now() + .seconds(8))
     stateLock.lock()
     discoverSemaphoreById[deviceId] = nil
-    let result = discoverResultById[deviceId] ?? "[]"
+    let result = discoverResultById.removeValue(forKey: deviceId) ?? "[]"
     stateLock.unlock()
     if waitResult == .timedOut { return "[]" }
     return result
@@ -394,6 +400,15 @@ class NitroBleScan: HybridNitroBleScanSpec {
 
     let id = peripheral.identifier.uuidString
     discoveredPeripherals[id] = peripheral
+    discoverOrder.removeAll { $0 == id }
+    discoverOrder.append(id)
+    if discoverOrder.count > maxTrackedPeripherals {
+      let overflow = discoverOrder.prefix(discoverOrder.count - maxTrackedPeripherals)
+      overflow.forEach { stale in
+        discoveredPeripherals.removeValue(forKey: stale)
+      }
+      discoverOrder = Array(discoverOrder.suffix(maxTrackedPeripherals))
+    }
     let now = nowMs()
     let manufacturerData = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data) ?? Data()
     let serviceUuids = ((advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []).map { $0.uuidString }
@@ -404,6 +419,12 @@ class NitroBleScan: HybridNitroBleScanSpec {
       return
     }
     seenDevices[dedupeKey] = now
+    if seenDevices.count > maxTrackedSeenDevices {
+      let oldest = seenDevices.sorted { $0.value < $1.value }.prefix(seenDevices.count - maxTrackedSeenDevices)
+      oldest.forEach { entry in
+        seenDevices.removeValue(forKey: entry.key)
+      }
+    }
     let smoothedRssi = smoothRssi(deviceId: id, rssi: RSSI.intValue)
     let score = calculateScore(
       rssi: smoothedRssi,
@@ -444,6 +465,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
     stateLock.lock()
     defer { stateLock.unlock() }
     let id = peripheral.identifier.uuidString
+    clearDeviceState(deviceId: id)
     connectionStateById[id] = "disconnected"
     connectResultById[id] = false
     connectSemaphoreById[id]?.signal()
@@ -461,9 +483,8 @@ class NitroBleScan: HybridNitroBleScanSpec {
     stateLock.lock()
     defer { stateLock.unlock() }
     let id = peripheral.identifier.uuidString
+    clearDeviceState(deviceId: id)
     connectionStateById[id] = "disconnected"
-    connectedPeripherals[id] = nil
-    serviceCache[id] = nil
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "disconnected"])
   }
 
@@ -490,6 +511,30 @@ class NitroBleScan: HybridNitroBleScanSpec {
       config.serviceUuids = uuids.compactMap { UUID(uuidString: $0) }.map(CBUUID.init)
     }
     return config
+  }
+
+  private func clearDeviceState(deviceId: String) {
+    connectedPeripherals.removeValue(forKey: deviceId)
+    serviceCache.removeValue(forKey: deviceId)
+    discoveredPeripherals.removeValue(forKey: deviceId)
+    discoverOrder.removeAll { $0 == deviceId }
+    connectResultById.removeValue(forKey: deviceId)
+    connectSemaphoreById.removeValue(forKey: deviceId)
+    discoverSemaphoreById.removeValue(forKey: deviceId)
+    discoverResultById.removeValue(forKey: deviceId)
+    let prefix = "\(deviceId)|"
+    readSemaphoreByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
+      readSemaphoreByKey.removeValue(forKey: key)
+      readResultByKey.removeValue(forKey: key)
+    }
+    writeSemaphoreByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
+      writeSemaphoreByKey.removeValue(forKey: key)
+      writeResultByKey.removeValue(forKey: key)
+    }
+    notifySemaphoreByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
+      notifySemaphoreByKey.removeValue(forKey: key)
+      notifyResultByKey.removeValue(forKey: key)
+    }
   }
 
   private struct ParsedConfig {

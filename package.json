@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-bluetooth-le-scan",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Nitro-powered BLE scanner for React Native.",
   "main": "lib/index",
   "module": "lib/index",
@@ -9,6 +9,7 @@
   "source": "src/index",
   "files": [
     "src",
+    "scripts",
     "react-native.config.js",
     "lib",
     "nitrogen",
@@ -36,7 +37,9 @@
     "typescript": "tsc",
     "specs": "npm run typescript && nitrogen --logLevel=\"debug\"",
     "nitrogen": "nitrogen",
-    "test": "jest"
+    "test": "jest",
+    "dx:scaffold": "node scripts/ble-scaffold.cjs",
+    "dx:diagnostics": "node scripts/ble-diagnostics.cjs"
   },
   "keywords": [
     "react-native",
