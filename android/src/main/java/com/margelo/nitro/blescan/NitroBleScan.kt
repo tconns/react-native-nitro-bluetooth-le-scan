@@ -3,6 +3,11 @@ package com.margelo.nitro.blescan
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
@@ -19,6 +24,10 @@ import androidx.core.content.ContextCompat
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
 import kotlin.math.roundToInt
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -40,6 +49,17 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private var rankingWeights = RankingWeights()
   private val lastSeenById = HashMap<String, Long>()
   private val rssiHistoryById = HashMap<String, ArrayDeque<Int>>()
+  private val gattByDeviceId = ConcurrentHashMap<String, BluetoothGatt>()
+  private val connectionStateByDeviceId = ConcurrentHashMap<String, String>()
+  private val serviceCacheByDeviceId = ConcurrentHashMap<String, String>()
+  private val connectLatchByDeviceId = ConcurrentHashMap<String, CountDownLatch>()
+  private val discoverLatchByDeviceId = ConcurrentHashMap<String, CountDownLatch>()
+  private val readLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
+  private val readValueByKey = ConcurrentHashMap<String, List<Int>>()
+  private val writeLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
+  private val writeResultByKey = ConcurrentHashMap<String, Boolean>()
+  private val notifyLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
+  private val notifyResultByKey = ConcurrentHashMap<String, Boolean>()
   private val classicReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: android.content.Context?, intent: Intent?) {
       try {
@@ -201,6 +221,165 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     }
   }
 
+  override fun connect(deviceId: String, optionsJson: String): Boolean {
+    if (!hasScanPermission()) {
+      emitError("BLE_PERMISSION_DENIED", "Missing Bluetooth permission for connect.", "Grant permission then retry.")
+      return false
+    }
+    val adapter = bluetoothManager.adapter ?: return false
+    val timeoutMs = parseConfigLong(optionsJson, "timeoutMs", 10000L).coerceIn(1000L, 30000L)
+    return try {
+      val device = adapter.getRemoteDevice(deviceId)
+      val latch = CountDownLatch(1)
+      connectLatchByDeviceId[deviceId] = latch
+      synchronized(stateLock) {
+        connectionStateByDeviceId[deviceId] = "connecting"
+        emitConnectionState(deviceId, "connecting")
+      }
+      val gatt =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+          device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+          device.connectGatt(context, false, gattCallback)
+        }
+      if (gatt == null) {
+        emitError("BLE_CONNECT_FAILED", "connectGatt returned null.", "Retry connect.")
+        connectLatchByDeviceId.remove(deviceId)
+        return false
+      }
+      gattByDeviceId[deviceId] = gatt
+      val ok = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+      connectLatchByDeviceId.remove(deviceId)
+      if (!ok || connectionStateByDeviceId[deviceId] != "connected") {
+        emitError("BLE_CONNECT_TIMEOUT", "Connect timed out for $deviceId.", "Retry or move closer to peripheral.")
+        false
+      } else {
+        true
+      }
+    } catch (error: Throwable) {
+      emitError("BLE_CONNECT_FAILED", "Failed to connect $deviceId.", "Retry connection.", error.message)
+      false
+    }
+  }
+
+  override fun disconnect(deviceId: String): Boolean {
+    synchronized(stateLock) {
+      val gatt = gattByDeviceId[deviceId] ?: return true
+      return try {
+        connectionStateByDeviceId[deviceId] = "disconnecting"
+        emitConnectionState(deviceId, "disconnecting")
+        gatt.disconnect()
+        gatt.close()
+        gattByDeviceId.remove(deviceId)
+        serviceCacheByDeviceId.remove(deviceId)
+        connectionStateByDeviceId[deviceId] = "disconnected"
+        emitConnectionState(deviceId, "disconnected")
+        true
+      } catch (_: Throwable) {
+        false
+      }
+    }
+  }
+
+  override fun discoverServices(deviceId: String): String {
+    serviceCacheByDeviceId[deviceId]?.let { return it }
+    val gatt = gattByDeviceId[deviceId] ?: return "[]"
+    return try {
+      val latch = CountDownLatch(1)
+      discoverLatchByDeviceId[deviceId] = latch
+      val started = gatt.discoverServices()
+      if (!started) {
+        discoverLatchByDeviceId.remove(deviceId)
+        return "[]"
+      }
+      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
+      discoverLatchByDeviceId.remove(deviceId)
+      if (!ok) return "[]"
+      serviceCacheByDeviceId[deviceId] ?: "[]"
+    } catch (_: Throwable) {
+      "[]"
+    }
+  }
+
+  override fun readCharacteristic(addressJson: String): String {
+    val address = parseAddress(addressJson) ?: return "[]"
+    val gatt = gattByDeviceId[address.deviceId] ?: return "[]"
+    val characteristic = findCharacteristic(gatt, address) ?: return "[]"
+    val key = characteristicKey(address)
+    return try {
+      val latch = CountDownLatch(1)
+      readLatchByKey[key] = latch
+      val started = gatt.readCharacteristic(characteristic)
+      if (!started) {
+        readLatchByKey.remove(key)
+        return "[]"
+      }
+      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
+      readLatchByKey.remove(key)
+      if (!ok) return "[]"
+      JSONArray(readValueByKey.remove(key) ?: emptyList<Int>()).toString()
+    } catch (_: Throwable) {
+      "[]"
+    }
+  }
+
+  override fun writeCharacteristic(addressJson: String, valueJson: String): Boolean {
+    val address = parseAddress(addressJson) ?: return false
+    val gatt = gattByDeviceId[address.deviceId] ?: return false
+    val characteristic = findCharacteristic(gatt, address) ?: return false
+    val value = parseByteArray(valueJson)
+    val key = characteristicKey(address)
+    return try {
+      val latch = CountDownLatch(1)
+      writeLatchByKey[key] = latch
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        gatt.writeCharacteristic(
+          characteristic,
+          intListToByteArray(value),
+          BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        )
+      } else {
+        characteristic.value = intListToByteArray(value)
+        gatt.writeCharacteristic(characteristic)
+      }
+      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
+      writeLatchByKey.remove(key)
+      if (!ok) return false
+      writeResultByKey.remove(key) ?: false
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
+  override fun setCharacteristicNotification(addressJson: String, enable: Boolean): Boolean {
+    val address = parseAddress(addressJson) ?: return false
+    val gatt = gattByDeviceId[address.deviceId] ?: return false
+    val characteristic = findCharacteristic(gatt, address) ?: return false
+    val key = characteristicKey(address)
+    return try {
+      if (!gatt.setCharacteristicNotification(characteristic, enable)) return false
+      val ccc =
+        characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+          ?: return true
+      ccc.value =
+        if (enable) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+      val latch = CountDownLatch(1)
+      notifyLatchByKey[key] = latch
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        gatt.writeDescriptor(ccc, ccc.value)
+      } else {
+        gatt.writeDescriptor(ccc)
+      }
+      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
+      notifyLatchByKey.remove(key)
+      if (!ok) return false
+      notifyResultByKey.remove(key) ?: false
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
   override fun getSnapshot(): String {
     synchronized(stateLock) {
       snapshot.adapterState = adapterStateString()
@@ -221,6 +400,138 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   override fun setEventListener(listener: (String) -> Unit) {
     synchronized(stateLock) {
       this.listener = listener
+    }
+  }
+
+  private val gattCallback = object : BluetoothGattCallback() {
+    override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+          connectionStateByDeviceId[deviceId] = "connected"
+          emitConnectionState(deviceId, "connected")
+          connectLatchByDeviceId.remove(deviceId)?.countDown()
+          return
+        }
+        connectionStateByDeviceId[deviceId] = "disconnected"
+        emitConnectionState(deviceId, "disconnected")
+        connectLatchByDeviceId.remove(deviceId)?.countDown()
+      }
+    }
+
+    override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+          val services = JSONArray()
+          gatt.services?.forEach { service ->
+            val chars = JSONArray()
+            service.characteristics?.forEach { chars.put(it.uuid.toString()) }
+            services.put(
+              JSONObject().apply {
+                put("uuid", service.uuid.toString())
+                put("characteristicUuids", chars)
+              }
+            )
+          }
+          val payload = services.toString()
+          serviceCacheByDeviceId[deviceId] = payload
+          emitEvent(
+            "servicesDiscovered",
+            JSONObject().apply {
+              put("deviceId", deviceId)
+              put("services", services)
+            }
+          )
+        }
+        discoverLatchByDeviceId.remove(deviceId)?.countDown()
+      }
+    }
+
+    override fun onCharacteristicRead(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      value: ByteArray,
+      status: Int
+    ) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        val key = "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+          readValueByKey[key] = value.map { byte: Byte -> byte.toInt() and 0xFF }
+        }
+        readLatchByKey.remove(key)?.countDown()
+      }
+    }
+
+    override fun onCharacteristicRead(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      status: Int
+    ) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        val key = "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+          readValueByKey[key] = (characteristic.value ?: byteArrayOf()).map { byte: Byte -> byte.toInt() and 0xFF }
+        }
+        readLatchByKey.remove(key)?.countDown()
+      }
+    }
+
+    override fun onCharacteristicWrite(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      status: Int
+    ) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        val key = "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
+        writeResultByKey[key] = status == BluetoothGatt.GATT_SUCCESS
+        writeLatchByKey.remove(key)?.countDown()
+      }
+    }
+
+    override fun onDescriptorWrite(
+      gatt: BluetoothGatt,
+      descriptor: BluetoothGattDescriptor,
+      status: Int
+    ) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        val key = "$deviceId|${descriptor.characteristic.service.uuid}|${descriptor.characteristic.uuid}"
+        notifyResultByKey[key] = status == BluetoothGatt.GATT_SUCCESS
+        notifyLatchByKey.remove(key)?.countDown()
+      }
+    }
+
+    override fun onCharacteristicChanged(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic,
+      value: ByteArray
+    ) {
+      synchronized(stateLock) {
+        val deviceId = gatt.device?.address ?: return
+        emitEvent(
+          "characteristicValueChanged",
+          JSONObject().apply {
+            put("deviceId", deviceId)
+            put("serviceUuid", characteristic.service.uuid.toString())
+            put("characteristicUuid", characteristic.uuid.toString())
+            put("value", JSONArray(value.map { byte: Byte -> byte.toInt() and 0xFF }))
+          }
+        )
+      }
+    }
+
+    override fun onCharacteristicChanged(
+      gatt: BluetoothGatt,
+      characteristic: BluetoothGattCharacteristic
+    ) {
+      synchronized(stateLock) {
+        val value = characteristic.value ?: byteArrayOf()
+        onCharacteristicChanged(gatt, characteristic, value)
+      }
     }
   }
 
@@ -414,6 +725,26 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     emitRawEvent(event)
   }
 
+  private fun emitConnectionState(deviceId: String, state: String) {
+    emitEvent(
+      "connectionStateChanged",
+      JSONObject().apply {
+        put("deviceId", deviceId)
+        put("state", state)
+      }
+    )
+  }
+
+  private fun emitEvent(type: String, payload: JSONObject) {
+    emitRawEvent(
+      JSONObject().apply {
+        put("type", type)
+        put("ts", nowMs())
+        put("payload", payload)
+      }
+    )
+  }
+
   private fun emitRawEvent(event: JSONObject) {
     listener?.let {
       try {
@@ -425,6 +756,50 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     } ?: run {
       snapshot.eventsDropped += 1
     }
+  }
+
+  private data class CharacteristicAddress(
+    val deviceId: String,
+    val serviceUuid: String,
+    val characteristicUuid: String
+  )
+
+  private fun parseAddress(json: String): CharacteristicAddress? {
+    return try {
+      val root = JSONObject(json)
+      CharacteristicAddress(
+        deviceId = root.optString("deviceId"),
+        serviceUuid = root.optString("serviceUuid"),
+        characteristicUuid = root.optString("characteristicUuid")
+      )
+    } catch (_: Throwable) {
+      null
+    }
+  }
+
+  private fun parseByteArray(json: String): List<Int> {
+    return try {
+      val arr = JSONArray(json)
+      List(arr.length()) { index -> arr.optInt(index, 0).coerceIn(0, 255) }
+    } catch (_: Throwable) {
+      emptyList()
+    }
+  }
+
+  private fun intListToByteArray(value: List<Int>): ByteArray {
+    return ByteArray(value.size) { index -> value[index].toByte() }
+  }
+
+  private fun findCharacteristic(
+    gatt: BluetoothGatt,
+    address: CharacteristicAddress
+  ): BluetoothGattCharacteristic? {
+    val service = gatt.getService(UUID.fromString(address.serviceUuid)) ?: return null
+    return service.getCharacteristic(UUID.fromString(address.characteristicUuid))
+  }
+
+  private fun characteristicKey(address: CharacteristicAddress): String {
+    return "${address.deviceId}|${address.serviceUuid}|${address.characteristicUuid}"
   }
 
   private fun buildScanSettings(configJson: String): ScanSettings {

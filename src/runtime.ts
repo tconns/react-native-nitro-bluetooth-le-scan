@@ -2,6 +2,8 @@ import EventEmitter from 'eventemitter3'
 import { getNitroBleScan } from './nitroInstance'
 import { eddystoneParser, iBeaconParser } from './parsers'
 import type {
+  BleGattCharacteristicAddress,
+  BleGattService,
   BleScanAdapterState,
   BleScanConfig,
   BleDistanceModel,
@@ -158,6 +160,25 @@ export const bleScanManager: BleScanManager = {
   async stopScan() {
     return native.stopScan()
   },
+  async connect(deviceId, options = {}) {
+    ensureListenerAttached()
+    return native.connect(deviceId, JSON.stringify(options))
+  },
+  async disconnect(deviceId) {
+    return native.disconnect(deviceId)
+  },
+  async discoverServices(deviceId) {
+    return parseJson<BleGattService[]>(native.discoverServices(deviceId), [])
+  },
+  async readCharacteristic(address) {
+    return parseJson<number[]>(native.readCharacteristic(JSON.stringify(address)), [])
+  },
+  async writeCharacteristic(address, value) {
+    return native.writeCharacteristic(JSON.stringify(address), JSON.stringify(value))
+  },
+  async setCharacteristicNotification(address, enable) {
+    return native.setCharacteristicNotification(JSON.stringify(address), enable)
+  },
   getSnapshot() {
     return parseJson(native.getSnapshot(), FALLBACK_SNAPSHOT)
   },
@@ -172,6 +193,24 @@ export const getBleAdapterState = () => bleScanManager.getAdapterState()
 export const ensureBleScanPermissions = () => bleScanManager.ensurePermissions()
 export const startBleScan = (config?: BleScanConfig) => bleScanManager.startScan(config)
 export const stopBleScan = () => bleScanManager.stopScan()
+export const connectBleDevice = (
+  deviceId: string,
+  options?: {timeoutMs?: number}
+) => bleScanManager.connect(deviceId, options)
+export const disconnectBleDevice = (deviceId: string) =>
+  bleScanManager.disconnect(deviceId)
+export const discoverBleServices = (deviceId: string) =>
+  bleScanManager.discoverServices(deviceId)
+export const readBleCharacteristic = (address: BleGattCharacteristicAddress) =>
+  bleScanManager.readCharacteristic(address)
+export const writeBleCharacteristic = (
+  address: BleGattCharacteristicAddress,
+  value: number[]
+) => bleScanManager.writeCharacteristic(address, value)
+export const setBleCharacteristicNotification = (
+  address: BleGattCharacteristicAddress,
+  enable: boolean
+) => bleScanManager.setCharacteristicNotification(address, enable)
 export const getBleScanSnapshot = () => bleScanManager.getSnapshot()
 export const subscribeBleScan = (listener: (event: BleScanEvent) => void) =>
   bleScanManager.subscribe(listener)

@@ -76,6 +76,17 @@ export type BleScanEvent =
   | { type: 'scanStopped'; ts: number; reason?: string }
   | { type: 'deviceFound'; ts: number; payload: BleScanResult }
   | { type: 'adapterStateChanged'; ts: number; payload: BleScanAdapterState }
+  | {
+      type: 'connectionStateChanged'
+      ts: number
+      payload: { deviceId: string; state: BleConnectionState }
+    }
+  | { type: 'servicesDiscovered'; ts: number; payload: { deviceId: string; services: BleGattService[] } }
+  | {
+      type: 'characteristicValueChanged'
+      ts: number
+      payload: BleGattCharacteristicAddress & { value: number[] }
+    }
   | { type: 'warning' | 'error'; ts: number; payload: BleScanError }
 
 export type BleScanSnapshot = {
@@ -96,6 +107,18 @@ export type BleScanManager = {
   ensurePermissions: () => Promise<boolean>
   startScan: (config?: BleScanConfig) => Promise<boolean>
   stopScan: () => Promise<boolean>
+  connect: (deviceId: string, options?: BleConnectionOptions) => Promise<boolean>
+  disconnect: (deviceId: string) => Promise<boolean>
+  discoverServices: (deviceId: string) => Promise<BleGattService[]>
+  readCharacteristic: (address: BleGattCharacteristicAddress) => Promise<number[]>
+  writeCharacteristic: (
+    address: BleGattCharacteristicAddress,
+    value: number[]
+  ) => Promise<boolean>
+  setCharacteristicNotification: (
+    address: BleGattCharacteristicAddress,
+    enable: boolean
+  ) => Promise<boolean>
   getSnapshot: () => BleScanSnapshot
   subscribe: (listener: (event: BleScanEvent) => void) => () => void
 }

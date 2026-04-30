@@ -21,16 +21,22 @@ export type {
 } from './types'
 export {
   bleScanManager,
+  connectBleDevice,
+  disconnectBleDevice,
+  discoverBleServices,
   estimateDistance,
   ensureBleScanPermissions,
   getBleAdapterState,
   getBleScanSnapshot,
+  readBleCharacteristic,
   rankDevices,
   registerManufacturerParser,
+  setBleCharacteristicNotification,
   startBleScan,
   stopBleScan,
   subscribeBleScan,
   unregisterManufacturerParser,
+  writeBleCharacteristic,
 } from './runtime'
 export {
   createConnectionStateGuard,
