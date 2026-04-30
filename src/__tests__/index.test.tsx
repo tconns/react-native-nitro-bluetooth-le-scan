@@ -1,20 +1,31 @@
-jest.mock('react-native-nitro-modules', () => ({
-  NitroModules: {
-    createHybridObject: () => ({
-      getAdapterState: () => 'poweredOn',
-      ensurePermissions: () => true,
-      setBluetoothEnabled: () => true,
-      startScan: () => true,
-      stopScan: () => true,
-      connect: () => true,
-      disconnect: () => true,
-      submitGattOperation: () => true,
-      getSnapshot: () => '{"isScanning":false,"adapterState":"poweredOn","seenDeviceCount":0,"eventsEmitted":0,"eventsDropped":0,"coalescedCount":0}',
-      setEventListener: () => undefined,
-      dispose: () => undefined,
-    }),
-  },
-}))
+jest.mock('react-native-nitro-modules', () => {
+  const instances: any[] = []
+  return {
+    NitroModules: {
+      createHybridObject: () => {
+        const instance = {
+          getAdapterState: () => 'poweredOn',
+          ensurePermissions: () => true,
+          setBluetoothEnabled: () => true,
+          startScan: () => true,
+          stopScan: () => true,
+          connect: () => true,
+          disconnect: () => true,
+          submitGattOperation: () => true,
+          getSnapshot: () => '{"isScanning":false,"adapterState":"poweredOn","seenDeviceCount":0,"eventsEmitted":0,"eventsDropped":0,"coalescedCount":0}',
+          setEventListener: () => undefined,
+          dispose: jest.fn(() => undefined),
+        }
+        instances.push(instance)
+        return instance
+      },
+    },
+    __nitroMock: {
+      getInstanceCount: () => instances.length,
+      getLastInstance: () => instances[instances.length - 1],
+    },
+  }
+})
 
 describe('react-native-nitro-bluetooth-le-scan', () => {
   it('exports runtime symbols', () => {
@@ -205,5 +216,16 @@ describe('react-native-nitro-bluetooth-le-scan', () => {
     const snapshot = mod.getBleScanSnapshot()
     expect(typeof snapshot.pendingOperationCount).toBe('number')
     expect(typeof snapshot.pendingOperationDeviceCount).toBe('number')
+  })
+
+  it('disposes runtime and recreates native instance on next use', async () => {
+    const mod = require('../index')
+    const nitro = require('react-native-nitro-modules')
+    expect(nitro.__nitroMock.getInstanceCount()).toBe(1)
+    mod.disposeBleRuntime()
+    const disposedInstance = nitro.__nitroMock.getLastInstance()
+    expect(disposedInstance.dispose).toHaveBeenCalledTimes(1)
+    mod.getBleAdapterState()
+    expect(nitro.__nitroMock.getInstanceCount()).toBe(2)
   })
 })

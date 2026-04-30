@@ -1,5 +1,5 @@
 import EventEmitter from 'eventemitter3'
-import { getNitroBleScan } from './nitroInstance'
+import { getNitroBleScan, resetNitroBleScan } from './nitroInstance'
 import { eddystoneParser, iBeaconParser } from './parsers'
 import type {
   BleGattCharacteristicAddress,
@@ -18,7 +18,6 @@ import type {
   ManufacturerParser,
 } from './types'
 
-const native = getNitroBleScan()
 const emitter = new EventEmitter()
 
 const FALLBACK_SNAPSHOT: BleScanSnapshot = {
@@ -49,6 +48,7 @@ const parserRegistry = new Map<string, ManufacturerParser>([
 
 let lastConfig: BleScanConfig = {}
 const operationTailByDeviceId = new Map<string, Promise<unknown>>()
+const pendingOperationCountByDeviceId = new Map<string, number>()
 const pendingGattByRequestId = new Map<
   string,
   {
@@ -57,6 +57,14 @@ const pendingGattByRequestId = new Map<
     timeoutHandle: ReturnType<typeof setTimeout>
   }
 >()
+let runtimeDisposed = false
+
+const getNative = () => {
+  if (runtimeDisposed) {
+    runtimeDisposed = false
+  }
+  return getNitroBleScan()
+}
 
 const clamp = (value: number, min = 0, max = 1) =>
   Math.max(min, Math.min(max, value))
@@ -172,7 +180,7 @@ function submitGattOperation<T>(
       reject(new Error(`${request.opName} timed out for ${request.deviceId}`))
     }, timeoutMs)
     pendingGattByRequestId.set(request.requestId, {resolve, reject, timeoutHandle})
-    const accepted = native.submitGattOperation(JSON.stringify(request))
+    const accepted = getNative().submitGattOperation(JSON.stringify(request))
     if (accepted) return
     pendingGattByRequestId.delete(request.requestId)
     clearTimeout(timeoutHandle)
@@ -184,11 +192,18 @@ async function enqueueByDevice<T>(
   deviceId: string,
   operation: () => Promise<T>
 ): Promise<T> {
+  pendingOperationCountByDeviceId.set(
+    deviceId,
+    (pendingOperationCountByDeviceId.get(deviceId) ?? 0) + 1
+  )
   const previous = operationTailByDeviceId.get(deviceId) ?? Promise.resolve()
   const next = previous.catch(() => undefined).then(operation)
   operationTailByDeviceId.set(
     deviceId,
     next.finally(() => {
+      const currentCount = pendingOperationCountByDeviceId.get(deviceId) ?? 0
+      if (currentCount <= 1) pendingOperationCountByDeviceId.delete(deviceId)
+      else pendingOperationCountByDeviceId.set(deviceId, currentCount - 1)
       if (operationTailByDeviceId.get(deviceId) === next) {
         operationTailByDeviceId.delete(deviceId)
       }
@@ -201,7 +216,7 @@ let listenerAttached = false
 function ensureListenerAttached() {
   if (listenerAttached) return
   listenerAttached = true
-  native.setEventListener((eventJson) => {
+  getNative().setEventListener((eventJson) => {
     const event = parseJson<BleScanEvent | null>(eventJson, null)
     if (event == null || typeof event.type !== 'string') return
     if (event.type === 'gattOperationResult') {
@@ -228,16 +243,16 @@ function ensureListenerAttached() {
 
 export const bleScanManager: BleScanManager = {
   getAdapterState() {
-    const state = native.getAdapterState()
+    const state = getNative().getAdapterState()
     if (typeof state !== 'string') return 'unknown'
     return state as BleScanAdapterState
   },
   async ensurePermissions() {
-    return native.ensurePermissions()
+    return getNative().ensurePermissions()
   },
   async setBluetoothEnabled(enable) {
     ensureListenerAttached()
-    return native.setBluetoothEnabled(enable)
+    return getNative().setBluetoothEnabled(enable)
   },
   async enableBluetooth() {
     return bleScanManager.setBluetoothEnabled(true)
@@ -248,19 +263,19 @@ export const bleScanManager: BleScanManager = {
   async startScan(config = {}) {
     ensureListenerAttached()
     lastConfig = config
-    return native.startScan(JSON.stringify(config))
+    return getNative().startScan(JSON.stringify(config))
   },
   async stopScan() {
-    return native.stopScan()
+    return getNative().stopScan()
   },
   async connect(deviceId, options = {}) {
     ensureListenerAttached()
     return enqueueByDevice(deviceId, async () =>
-      native.connect(deviceId, JSON.stringify(options))
+      getNative().connect(deviceId, JSON.stringify(options))
     )
   },
   async disconnect(deviceId) {
-    return enqueueByDevice(deviceId, async () => native.disconnect(deviceId))
+    return enqueueByDevice(deviceId, async () => getNative().disconnect(deviceId))
   },
   async discoverServices(deviceId, options: BleGattOperationOptions = {}) {
     return enqueueByDevice(deviceId, async () => {
@@ -328,11 +343,15 @@ export const bleScanManager: BleScanManager = {
     })
   },
   getSnapshot() {
-    const snapshot = parseJson(native.getSnapshot(), FALLBACK_SNAPSHOT)
+    const snapshot = parseJson(getNative().getSnapshot(), FALLBACK_SNAPSHOT)
+    const pendingOperationCount = [...pendingOperationCountByDeviceId.values()].reduce(
+      (sum, count) => sum + count,
+      0
+    )
     return {
       ...snapshot,
-      pendingOperationCount: operationTailByDeviceId.size,
-      pendingOperationDeviceCount: operationTailByDeviceId.size,
+      pendingOperationCount,
+      pendingOperationDeviceCount: pendingOperationCountByDeviceId.size,
     }
   },
   subscribe(listener) {
@@ -393,9 +412,13 @@ export const disposeBleRuntime = () => {
   })
   pendingGattByRequestId.clear()
   operationTailByDeviceId.clear()
+  pendingOperationCountByDeviceId.clear()
+  listenerAttached = false
+  runtimeDisposed = true
   try {
-    native.dispose()
+    getNitroBleScan().dispose()
   } catch {
     // best effort
   }
+  resetNitroBleScan()
 }

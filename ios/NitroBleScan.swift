@@ -886,7 +886,8 @@ class NitroBleScan: HybridNitroBleScanSpec {
       centralManager.stopScan()
       isScanning = false
     }
-    pendingGattByRequestId.keys.forEach { requestId in
+    let pendingRequestIds = Array(pendingGattByRequestId.keys)
+    pendingRequestIds.forEach { requestId in
       completePendingRequest(
         requestId: requestId,
         success: false,

@@ -9,3 +9,7 @@ export function getNitroBleScan(): NitroBleScanSpec {
   }
   return instance
 }
+
+export function resetNitroBleScan() {
+  instance = null
+}

@@ -427,6 +427,12 @@ Native lifecycle note:
 
 - This module now uses proactive native cleanup via `dispose()` (called by `disposeBleRuntime()`), instead of relying on `finalize` timing.
 
+Runtime lifecycle contract:
+
+- `disposeBleRuntime()` rejects all in-flight JS GATT requests and clears queue/listener state.
+- after `disposeBleRuntime()`, next API call lazily recreates the native singleton and re-attaches event listener.
+- pending counters reset to zero immediately after dispose.
+
 ## DX Commands
 
 ### Scaffold a BLE screen
