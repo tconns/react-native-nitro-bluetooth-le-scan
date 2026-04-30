@@ -39,7 +39,12 @@
     "nitrogen": "nitrogen",
     "test": "jest",
     "dx:scaffold": "node scripts/ble-scaffold.cjs",
-    "dx:diagnostics": "node scripts/ble-diagnostics.cjs"
+    "dx:diagnostics": "node scripts/ble-diagnostics.cjs",
+    "npm:login:web": "npm login --registry https://registry.npmjs.org/ --auth-type=web",
+    "npm:whoami": "npm whoami --registry https://registry.npmjs.org/",
+    "prepublishOnly": "npm run typecheck && npm test && npm run typescript",
+    "release:npm": "npm run npm:login:web && npm publish --access public",
+    "release:npm:provenance": "npm publish --access public --provenance"
   },
   "keywords": [
     "react-native",
@@ -65,7 +70,8 @@
   },
   "homepage": "https://github.com/tconns/react-native-nitro-bluetooth-le-scan#readme",
   "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "devDependencies": {
     "@react-native/babel-preset": "^0.85.2",
