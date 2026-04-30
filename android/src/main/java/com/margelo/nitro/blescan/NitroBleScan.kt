@@ -18,6 +18,7 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
+import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -34,35 +35,50 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private var classicReceiverRegistered = false
   private var classicDiscoveryEnabled = true
   private var coalescingWindowMs = 150L
+  private var dedupeMode = "deviceId"
+  private var rssiSmoothingWindow = 5
+  private var rankingWeights = RankingWeights()
   private val lastSeenById = HashMap<String, Long>()
+  private val rssiHistoryById = HashMap<String, ArrayDeque<Int>>()
   private val classicReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: android.content.Context?, intent: Intent?) {
-      if (intent == null) return
-      when (intent.action) {
-        BluetoothDevice.ACTION_FOUND -> {
-          val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-          val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
-          if (device != null) {
-            onClassicDeviceFound(device, rssi.toInt())
+      try {
+        if (intent == null) return
+        when (intent.action) {
+          BluetoothDevice.ACTION_FOUND -> {
+            val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+            val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
+            if (device != null) {
+              onClassicDeviceFound(device, rssi.toInt())
+            }
           }
-        }
-        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-          synchronized(stateLock) {
-            if (snapshot.isScanning && classicDiscoveryEnabled) {
-              val adapter = bluetoothManager.adapter
-              if (adapter != null && adapter.isEnabled) {
-                try {
-                  adapter.startDiscovery()
-                } catch (_: Throwable) {
-                  emitWarning(
-                    "BLE_CLASSIC_RESTART_FAILED",
-                    "Classic discovery stopped unexpectedly.",
-                    "Retry scan or toggle Bluetooth."
-                  )
+          BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+            synchronized(stateLock) {
+              if (snapshot.isScanning && classicDiscoveryEnabled) {
+                val adapter = bluetoothManager.adapter
+                if (adapter != null && adapter.isEnabled) {
+                  try {
+                    adapter.startDiscovery()
+                  } catch (_: Throwable) {
+                    emitWarning(
+                      "BLE_CLASSIC_RESTART_FAILED",
+                      "Classic discovery stopped unexpectedly.",
+                      "Retry scan or toggle Bluetooth."
+                    )
+                  }
                 }
               }
             }
           }
+        }
+      } catch (error: Throwable) {
+        synchronized(stateLock) {
+          snapshot.eventsDropped += 1
+          emitWarning(
+            "BLE_CLASSIC_CALLBACK_ERROR",
+            "Classic callback failed: ${error.message ?: error::class.java.simpleName}",
+            "Continue scanning with BLE."
+          )
         }
       }
     }
@@ -90,6 +106,13 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     var eventsDropped: Int,
     var coalescedCount: Int,
     var lastErrorCode: String?
+  )
+
+  private data class RankingWeights(
+    val rssi: Double = 0.6,
+    val recency: Double = 0.25,
+    val connectable: Double = 0.1,
+    val transport: Double = 0.05
   )
 
   override fun getAdapterState(): String {
@@ -127,7 +150,11 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       val filters = buildScanFilters(configJson)
       coalescingWindowMs = parseConfigLong(configJson, "coalescingWindowMs", 150L).coerceAtLeast(0L)
       classicDiscoveryEnabled = parseConfigBoolean(configJson, "enableClassicDiscovery", true)
+      dedupeMode = parseConfigString(configJson, "dedupeMode", "deviceId")
+      rssiSmoothingWindow = parseConfigInt(configJson, "rssiSmoothingWindow", 5).coerceIn(1, 20)
+      rankingWeights = parseRankingWeights(configJson)
       lastSeenById.clear()
+      rssiHistoryById.clear()
       snapshot.seenDeviceCount = 0
       scanCallback = createScanCallback()
       var startedAnyScan = false
@@ -200,11 +227,33 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private fun createScanCallback(): ScanCallback {
     return object : ScanCallback() {
       override fun onScanResult(callbackType: Int, result: ScanResult?) {
-        if (result != null) onDeviceFound(result)
+        try {
+          if (result != null) onDeviceFound(result)
+        } catch (error: Throwable) {
+          synchronized(stateLock) {
+            snapshot.eventsDropped += 1
+            emitWarning(
+              "BLE_SCAN_CALLBACK_ERROR",
+              "Scan callback failed: ${error.message ?: error::class.java.simpleName}",
+              "Continue scanning or restart scan."
+            )
+          }
+        }
       }
 
       override fun onBatchScanResults(results: MutableList<ScanResult>?) {
-        results?.forEach(::onDeviceFound)
+        try {
+          results?.forEach(::onDeviceFound)
+        } catch (error: Throwable) {
+          synchronized(stateLock) {
+            snapshot.eventsDropped += 1
+            emitWarning(
+              "BLE_SCAN_BATCH_CALLBACK_ERROR",
+              "Batch callback failed: ${error.message ?: error::class.java.simpleName}",
+              "Continue scanning or restart scan."
+            )
+          }
+        }
       }
 
       override fun onScanFailed(errorCode: Int) {
@@ -230,28 +279,54 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private fun onDeviceFound(result: ScanResult) {
     synchronized(stateLock) {
       val device = result.device ?: return
-      val deviceId = device.address ?: return
+      val deviceId = safeDeviceAddress(device) ?: return
       val now = nowMs()
-      val lastSeen = lastSeenById[deviceId]
+      val rawManufacturerData = result.scanRecord?.manufacturerSpecificData
+      val manufacturerBytes = extractManufacturerData(rawManufacturerData)
+      val serviceUuids = result.scanRecord?.serviceUuids?.map { it.uuid.toString() } ?: emptyList()
+      val serviceData = extractServiceData(result)
+      val fingerprint = buildFingerprint(deviceId, manufacturerBytes, serviceUuids)
+      val dedupeKey = if (dedupeMode == "fingerprint") fingerprint else deviceId
+      val lastSeen = lastSeenById[dedupeKey]
       if (lastSeen != null && now - lastSeen < coalescingWindowMs) {
         snapshot.coalescedCount += 1
         return
       }
-      lastSeenById[deviceId] = now
+      lastSeenById[dedupeKey] = now
       snapshot.seenDeviceCount = lastSeenById.size
+      val smoothedRssi = smoothRssi(deviceId, result.rssi)
+      val score = calculateScore(
+        rssi = smoothedRssi,
+        isConnectable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) result.isConnectable else false,
+        transport = "ble",
+        seenAt = now
+      )
       val payload = JSONObject().apply {
         put("id", deviceId)
         put("transport", "ble")
-        put("name", device.name ?: result.scanRecord?.deviceName)
+        put("name", safeDeviceName(device) ?: result.scanRecord?.deviceName)
         put("rssi", result.rssi)
+        put("smoothedRssi", smoothedRssi)
+        put("score", score)
+        put("fingerprint", fingerprint)
         put("timestampMs", now)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
           put("txPower", result.txPower)
           put("isConnectable", result.isConnectable)
         }
         val uuids = JSONArray()
-        result.scanRecord?.serviceUuids?.forEach { uuids.put(it.uuid.toString()) }
+        serviceUuids.forEach { uuids.put(it) }
         put("serviceUuids", uuids)
+        val manufacturerJson = JSONArray()
+        manufacturerBytes.forEach { manufacturerJson.put(it) }
+        put("manufacturerData", manufacturerJson)
+        val serviceDataJson = JSONObject()
+        serviceData.forEach { (key, value) ->
+          val arr = JSONArray()
+          value.forEach { arr.put(it) }
+          serviceDataJson.put(key, arr)
+        }
+        put("serviceData", serviceDataJson)
       }
       val event = JSONObject().apply {
         put("type", "deviceFound")
@@ -264,20 +339,32 @@ class NitroBleScan : HybridNitroBleScanSpec() {
 
   private fun onClassicDeviceFound(device: BluetoothDevice, rssi: Int) {
     synchronized(stateLock) {
-      val deviceId = device.address ?: return
+      val deviceId = safeDeviceAddress(device) ?: return
       val now = nowMs()
-      val lastSeen = lastSeenById[deviceId]
+      val fingerprint = buildFingerprint(deviceId, emptyList(), emptyList())
+      val dedupeKey = if (dedupeMode == "fingerprint") fingerprint else deviceId
+      val lastSeen = lastSeenById[dedupeKey]
       if (lastSeen != null && now - lastSeen < coalescingWindowMs) {
         snapshot.coalescedCount += 1
         return
       }
-      lastSeenById[deviceId] = now
+      lastSeenById[dedupeKey] = now
       snapshot.seenDeviceCount = lastSeenById.size
+      val smoothedRssi = smoothRssi(deviceId, rssi)
+      val score = calculateScore(
+        rssi = smoothedRssi,
+        isConnectable = true,
+        transport = "classic",
+        seenAt = now
+      )
       val payload = JSONObject().apply {
         put("id", deviceId)
         put("transport", "classic")
-        put("name", device.name)
+        put("name", safeDeviceName(device))
         put("rssi", rssi)
+        put("smoothedRssi", smoothedRssi)
+        put("score", score)
+        put("fingerprint", fingerprint)
         put("timestampMs", now)
       }
       val event = JSONObject().apply {
@@ -387,12 +474,94 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     }
   }
 
+  private fun parseConfigInt(configJson: String, key: String, fallback: Int): Int {
+    return try {
+      JSONObject(configJson).optInt(key, fallback)
+    } catch (_: Throwable) {
+      fallback
+    }
+  }
+
   private fun parseConfigBoolean(configJson: String, key: String, fallback: Boolean): Boolean {
     return try {
       JSONObject(configJson).optBoolean(key, fallback)
     } catch (_: Throwable) {
       fallback
     }
+  }
+
+  private fun parseRankingWeights(configJson: String): RankingWeights {
+    return try {
+      val root = JSONObject(configJson)
+      val weights = root.optJSONObject("rankingWeights") ?: return RankingWeights()
+      RankingWeights(
+        rssi = weights.optDouble("rssi", 0.6),
+        recency = weights.optDouble("recency", 0.25),
+        connectable = weights.optDouble("connectable", 0.1),
+        transport = weights.optDouble("transport", 0.05)
+      )
+    } catch (_: Throwable) {
+      RankingWeights()
+    }
+  }
+
+  private fun smoothRssi(deviceId: String, rssi: Int): Int {
+    val history = rssiHistoryById.getOrPut(deviceId) { ArrayDeque() }
+    history.addLast(rssi)
+    while (history.size > rssiSmoothingWindow) {
+      history.removeFirst()
+    }
+    return history.average().toInt()
+  }
+
+  private fun calculateScore(
+    rssi: Int,
+    isConnectable: Boolean,
+    transport: String,
+    seenAt: Long
+  ): Double {
+    val rssiScore = ((rssi + 100).coerceIn(0, 70) / 70.0)
+    val ageScore = (1.0 - ((nowMs() - seenAt).coerceAtLeast(0L) / 15000.0)).coerceIn(0.0, 1.0)
+    val connectableScore = if (isConnectable) 1.0 else 0.0
+    val transportScore = if (transport == "ble") 1.0 else 0.7
+    val score =
+      rankingWeights.rssi * rssiScore +
+      rankingWeights.recency * ageScore +
+      rankingWeights.connectable * connectableScore +
+      rankingWeights.transport * transportScore
+    return (score * 1000.0).roundToInt() / 1000.0
+  }
+
+  private fun buildFingerprint(
+    id: String,
+    manufacturerData: List<Int>,
+    serviceUuids: List<String>
+  ): String {
+    val mf = manufacturerData.take(8).joinToString("-")
+    val su = serviceUuids.sorted().take(4).joinToString("|")
+    return "$id#$mf#$su"
+  }
+
+  private fun extractManufacturerData(data: android.util.SparseArray<ByteArray>?): List<Int> {
+    if (data == null || data.size() == 0) return emptyList()
+    val bytes = mutableListOf<Int>()
+    for (index in 0 until data.size()) {
+      val chunk = data.valueAt(index) ?: continue
+      chunk.forEach { bytes.add(it.toInt() and 0xFF) }
+      if (bytes.size >= 24) break
+    }
+    return bytes.take(24)
+  }
+
+  private fun extractServiceData(result: ScanResult): Map<String, List<Int>> {
+    val serviceData = mutableMapOf<String, List<Int>>()
+    val record = result.scanRecord ?: return serviceData
+    val map = record.serviceData ?: return serviceData
+    map.entries.forEach { (uuid, data) ->
+      if (uuid == null || data == null) return@forEach
+      serviceData[uuid.uuid.toString()] = data.take(20).map { it.toInt() and 0xFF }
+    }
+    return serviceData
   }
 
   private fun startClassicDiscovery(adapter: BluetoothAdapter): Boolean {
@@ -458,6 +627,27 @@ class NitroBleScan : HybridNitroBleScanSpec() {
         // no-op
       }
       classicReceiverRegistered = false
+    }
+  }
+
+  private fun safeDeviceAddress(device: BluetoothDevice): String? {
+    return try {
+      device.address
+    } catch (_: SecurityException) {
+      snapshot.eventsDropped += 1
+      null
+    } catch (_: Throwable) {
+      null
+    }
+  }
+
+  private fun safeDeviceName(device: BluetoothDevice): String? {
+    return try {
+      device.name
+    } catch (_: SecurityException) {
+      null
+    } catch (_: Throwable) {
+      null
     }
   }
 

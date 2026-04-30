@@ -9,6 +9,8 @@ Nitro-powered BLE scanner for React Native.
 - Nitro-first architecture (Android native + iOS native + JS facade)
 - Scan lifecycle API: start, stop, adapter state, permission check
 - Event stream with coalescing support
+- Device intelligence metadata: `smoothedRssi`, `score`, `fingerprint`
+- Distance/ranking helpers and manufacturer parser plugin hooks
 - Snapshot counters (`eventsEmitted`, `eventsDropped`, `coalescedCount`)
 - Unified error model with `code`, `message`, `recoveryHint`
 
@@ -50,9 +52,12 @@ Library manifest already declares BLE-related permissions, but the host app is s
 
 ```ts
 import {
+  estimateDistance,
   ensureBleScanPermissions,
   getBleAdapterState,
   getBleScanSnapshot,
+  rankDevices,
+  registerManufacturerParser,
   startBleScan,
   stopBleScan,
   subscribeBleScan,
@@ -67,14 +72,24 @@ async function demo() {
 
   const unsubscribe = subscribeBleScan((event) => {
     if (event.type === 'deviceFound') {
-      console.log('device', event.payload.id, event.payload.rssi)
+      const distance = estimateDistance(event.payload.smoothedRssi ?? event.payload.rssi)
+      console.log('device', event.payload.id, event.payload.score, distance)
     }
+  })
+
+  registerManufacturerParser({
+    id: 'custom-parser',
+    canParse: (result) => (result.manufacturerData?.length ?? 0) > 0,
+    parse: (result) => ({preview: result.manufacturerData?.slice(0, 4)}),
   })
 
   await startBleScan({
     mode: 'balanced',
     allowDuplicates: false,
     coalescingWindowMs: 150,
+    dedupeMode: 'fingerprint',
+    rssiSmoothingWindow: 5,
+    rankingWeights: {rssi: 0.6, recency: 0.25, connectable: 0.1, transport: 0.05},
   })
 
   setTimeout(async () => {
@@ -93,6 +108,10 @@ async function demo() {
 - `stopBleScan(): Promise<boolean>`
 - `getBleScanSnapshot(): BleScanSnapshot`
 - `subscribeBleScan(listener): unsubscribe`
+- `estimateDistance(rssi, model?): number`
+- `rankDevices(devices, weights?): BleScanResult[]`
+- `registerManufacturerParser(parser): void`
+- `unregisterManufacturerParser(parserId): void`
 
 ### Event types
 

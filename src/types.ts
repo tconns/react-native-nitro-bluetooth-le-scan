@@ -4,6 +4,20 @@ export type BleScanFilter = {
   manufacturerDataPrefix?: number[]
 }
 
+export type BleDedupeMode = 'deviceId' | 'fingerprint'
+
+export type BleDistanceModel = {
+  txPowerAt1m?: number
+  pathLossExponent?: number
+}
+
+export type BleRankingWeights = {
+  rssi?: number
+  recency?: number
+  connectable?: number
+  transport?: number
+}
+
 export type BleScanConfig = {
   mode?: 'balanced' | 'lowLatency' | 'lowPower'
   allowDuplicates?: boolean
@@ -11,7 +25,17 @@ export type BleScanConfig = {
   legacy?: boolean
   coalescingWindowMs?: number
   enableClassicDiscovery?: boolean
+  dedupeMode?: BleDedupeMode
+  rssiSmoothingWindow?: number
+  distanceModel?: BleDistanceModel
+  rankingWeights?: BleRankingWeights
+  manufacturerParsers?: string[]
   filters?: BleScanFilter[]
+}
+
+export type BleParsedManufacturerData = {
+  parserId: string
+  data: unknown
 }
 
 export type BleScanResult = {
@@ -19,9 +43,14 @@ export type BleScanResult = {
   transport?: 'ble' | 'classic'
   name?: string
   rssi: number
+  smoothedRssi?: number
+  distanceEstimateMeters?: number
+  score?: number
+  fingerprint?: string
   txPower?: number
   serviceUuids?: string[]
   manufacturerData?: number[]
+  parsedManufacturerData?: BleParsedManufacturerData[]
   serviceData?: Record<string, number[]>
   isConnectable?: boolean
   timestampMs: number
@@ -52,6 +81,7 @@ export type BleScanEvent =
 export type BleScanSnapshot = {
   isScanning: boolean
   adapterState: BleScanAdapterState
+  supportsClassicDiscovery?: boolean
   lastStartTs?: number
   lastStopTs?: number
   seenDeviceCount: number
@@ -68,4 +98,10 @@ export type BleScanManager = {
   stopScan: () => Promise<boolean>
   getSnapshot: () => BleScanSnapshot
   subscribe: (listener: (event: BleScanEvent) => void) => () => void
+}
+
+export type ManufacturerParser = {
+  id: string
+  canParse: (result: BleScanResult) => boolean
+  parse: (result: BleScanResult) => unknown
 }

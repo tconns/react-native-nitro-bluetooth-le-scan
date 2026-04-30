@@ -36,7 +36,18 @@ class NitroBleScan: HybridNitroBleScanSpec {
   private var lastErrorCode: String?
   private var coalescingWindowMs: Int64 = 150
   private var seenDevices: [String: Int64] = [:]
+  private var rssiHistory: [String: [Int]] = [:]
+  private var dedupeMode = "deviceId"
+  private var rssiSmoothingWindow = 5
+  private var rankingWeights = RankingWeights()
   private var stateLock = NSLock()
+
+  private struct RankingWeights {
+    var rssi = 0.6
+    var recency = 0.25
+    var connectable = 0.1
+    var transport = 0.05
+  }
 
   override init() {
     super.init()
@@ -83,7 +94,11 @@ class NitroBleScan: HybridNitroBleScanSpec {
       )
     }
     coalescingWindowMs = max(0, config.coalescingWindowMs ?? 150)
+    dedupeMode = config.dedupeMode ?? "deviceId"
+    rssiSmoothingWindow = min(max(config.rssiSmoothingWindow ?? 5, 1), 20)
+    rankingWeights = config.rankingWeights ?? RankingWeights()
     seenDevices.removeAll()
+    rssiHistory.removeAll()
 
     var options: [String: Any] = [CBCentralManagerScanOptionAllowDuplicatesKey: config.allowDuplicates ?? false]
     if let solicited = config.serviceUuids, !solicited.isEmpty {
@@ -117,6 +132,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
     var payload: [String: Any] = [
       "isScanning": isScanning,
       "adapterState": adapterStateString(centralManager.state),
+      "supportsClassicDiscovery": false,
       "seenDeviceCount": seenDevices.count,
       "eventsEmitted": eventsEmitted,
       "eventsDropped": eventsDropped,
@@ -151,21 +167,32 @@ class NitroBleScan: HybridNitroBleScanSpec {
 
     let id = peripheral.identifier.uuidString
     let now = nowMs()
-    if let lastSeen = seenDevices[id], now - lastSeen < coalescingWindowMs {
+    let manufacturerData = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data) ?? Data()
+    let serviceUuids = ((advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []).map { $0.uuidString }
+    let fingerprint = buildFingerprint(id: id, manufacturerData: manufacturerData, serviceUuids: serviceUuids)
+    let dedupeKey = dedupeMode == "fingerprint" ? fingerprint : id
+    if let lastSeen = seenDevices[dedupeKey], now - lastSeen < coalescingWindowMs {
       coalescedCount += 1
       return
     }
-    seenDevices[id] = now
-
-    var serviceUuids: [String] = []
-    if let uuids = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] {
-      serviceUuids = uuids.map { $0.uuidString }
-    }
+    seenDevices[dedupeKey] = now
+    let smoothedRssi = smoothRssi(deviceId: id, rssi: RSSI.intValue)
+    let score = calculateScore(
+      rssi: smoothedRssi,
+      isConnectable: (advertisementData[CBAdvertisementDataIsConnectable] as? Bool) ?? false,
+      transport: "ble",
+      seenAt: now
+    )
 
     let payload: [String: Any] = [
       "id": id,
+      "transport": "ble",
       "name": peripheral.name as Any,
       "rssi": RSSI.intValue,
+      "smoothedRssi": smoothedRssi,
+      "score": score,
+      "fingerprint": fingerprint,
+      "manufacturerData": manufacturerData.map { Int($0) },
       "serviceUuids": serviceUuids,
       "timestampMs": now,
       "isConnectable": advertisementData[CBAdvertisementDataIsConnectable] as Any
@@ -182,6 +209,16 @@ class NitroBleScan: HybridNitroBleScanSpec {
     config.allowDuplicates = obj["allowDuplicates"] as? Bool
     config.coalescingWindowMs = obj["coalescingWindowMs"] as? Int64
     config.enableClassicDiscovery = obj["enableClassicDiscovery"] as? Bool
+    config.dedupeMode = obj["dedupeMode"] as? String
+    config.rssiSmoothingWindow = obj["rssiSmoothingWindow"] as? Int
+    if let rw = obj["rankingWeights"] as? [String: Any] {
+      config.rankingWeights = RankingWeights(
+        rssi: (rw["rssi"] as? NSNumber)?.doubleValue ?? 0.6,
+        recency: (rw["recency"] as? NSNumber)?.doubleValue ?? 0.25,
+        connectable: (rw["connectable"] as? NSNumber)?.doubleValue ?? 0.1,
+        transport: (rw["transport"] as? NSNumber)?.doubleValue ?? 0.05
+      )
+    }
     if let uuids = obj["serviceUuids"] as? [String] {
       config.serviceUuids = uuids.compactMap { UUID(uuidString: $0) }.map(CBUUID.init)
     }
@@ -192,7 +229,40 @@ class NitroBleScan: HybridNitroBleScanSpec {
     var allowDuplicates: Bool?
     var coalescingWindowMs: Int64?
     var enableClassicDiscovery: Bool?
+    var dedupeMode: String?
+    var rssiSmoothingWindow: Int?
+    var rankingWeights: RankingWeights?
     var serviceUuids: [CBUUID]?
+  }
+
+  private func smoothRssi(deviceId: String, rssi: Int) -> Int {
+    var history = rssiHistory[deviceId] ?? []
+    history.append(rssi)
+    if history.count > rssiSmoothingWindow {
+      history.removeFirst(history.count - rssiSmoothingWindow)
+    }
+    rssiHistory[deviceId] = history
+    return history.reduce(0, +) / max(history.count, 1)
+  }
+
+  private func calculateScore(rssi: Int, isConnectable: Bool, transport: String, seenAt: Int64) -> Double {
+    let rssiScore = max(0.0, min(1.0, Double(max(0, min(70, rssi + 100))) / 70.0))
+    let ageMs = max(0, nowMs() - seenAt)
+    let recencyScore = max(0.0, min(1.0, 1.0 - Double(ageMs) / 15000.0))
+    let connectableScore = isConnectable ? 1.0 : 0.0
+    let transportScore = transport == "ble" ? 1.0 : 0.7
+    let score =
+      rankingWeights.rssi * rssiScore
+      + rankingWeights.recency * recencyScore
+      + rankingWeights.connectable * connectableScore
+      + rankingWeights.transport * transportScore
+    return (score * 1000).rounded() / 1000
+  }
+
+  private func buildFingerprint(id: String, manufacturerData: Data, serviceUuids: [String]) -> String {
+    let mf = manufacturerData.prefix(8).map { String($0) }.joined(separator: "-")
+    let su = serviceUuids.sorted().prefix(4).joined(separator: "|")
+    return "\(id)#\(mf)#\(su)"
   }
 
   private func emitSimpleEvent(type: String, reason: String?) {

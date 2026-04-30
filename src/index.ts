@@ -1,19 +1,28 @@
 export type {
   BleScanAdapterState,
+  BleDedupeMode,
+  BleDistanceModel,
   BleScanError,
   BleScanEvent,
   BleScanFilter,
   BleScanManager,
+  BleParsedManufacturerData,
+  BleRankingWeights,
   BleScanSnapshot,
   BleScanConfig,
   BleScanResult,
+  ManufacturerParser,
 } from './types'
 export {
   bleScanManager,
+  estimateDistance,
   ensureBleScanPermissions,
   getBleAdapterState,
   getBleScanSnapshot,
+  rankDevices,
+  registerManufacturerParser,
   startBleScan,
   stopBleScan,
   subscribeBleScan,
+  unregisterManufacturerParser,
 } from './runtime'
