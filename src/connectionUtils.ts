@@ -20,6 +20,34 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const keyOf = (address: BleGattCharacteristicAddress) =>
   `${address.deviceId}|${address.serviceUuid}|${address.characteristicUuid}`
 
+export type BleGattOpName =
+  | 'connect'
+  | 'disconnect'
+  | 'discoverServices'
+  | 'readCharacteristic'
+  | 'writeCharacteristic'
+  | 'setNotification'
+
+export type BleGattOpMetric = {
+  opName: BleGattOpName
+  deviceId: string
+  startedAtMs: number
+  elapsedMs: number
+  success: boolean
+  errorMessage?: string
+}
+
+export type BleFaultInjectionPolicy = Partial<
+  Record<
+    BleGattOpName,
+    {
+      failTimes?: number
+      failWith?: string
+      delayMs?: number
+    }
+  >
+>
+
 export const withTimeout = async <T>(
   promise: Promise<T>,
   timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -181,4 +209,125 @@ export const createNotificationManager = () => {
     active.clear()
   }
   return {subscribe, unsubscribe, clear}
+}
+
+export const createGattOperationQueue = () => {
+  const tailByDeviceId = new Map<string, Promise<unknown>>()
+
+  const enqueue = <T>(deviceId: string, operation: () => Promise<T>): Promise<T> => {
+    const previous = tailByDeviceId.get(deviceId) ?? Promise.resolve()
+    const run = previous.catch(() => undefined).then(operation)
+    tailByDeviceId.set(
+      deviceId,
+      run.finally(() => {
+        if (tailByDeviceId.get(deviceId) === run) {
+          tailByDeviceId.delete(deviceId)
+        }
+      })
+    )
+    return run
+  }
+
+  const clear = (deviceId?: string) => {
+    if (deviceId == null) tailByDeviceId.clear()
+    else tailByDeviceId.delete(deviceId)
+  }
+
+  return {enqueue, clear}
+}
+
+export const createInstrumentedConnectionAdapter = (
+  adapter: BleConnectionAdapter,
+  onMetric: (metric: BleGattOpMetric) => void
+): BleConnectionAdapter => {
+  const track = async <T>(
+    opName: BleGattOpName,
+    deviceId: string,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    const startedAtMs = Date.now()
+    try {
+      const result = await operation()
+      onMetric({
+        opName,
+        deviceId,
+        startedAtMs,
+        elapsedMs: Date.now() - startedAtMs,
+        success: true,
+      })
+      return result
+    } catch (error) {
+      onMetric({
+        opName,
+        deviceId,
+        startedAtMs,
+        elapsedMs: Date.now() - startedAtMs,
+        success: false,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+  }
+
+  return {
+    connect: (deviceId) => track('connect', deviceId, () => adapter.connect(deviceId)),
+    disconnect: (deviceId) =>
+      track('disconnect', deviceId, () => adapter.disconnect(deviceId)),
+    discoverServices: (deviceId) =>
+      track('discoverServices', deviceId, () => adapter.discoverServices(deviceId)),
+    readCharacteristic: (address) =>
+      track('readCharacteristic', address.deviceId, () =>
+        adapter.readCharacteristic(address)
+      ),
+    writeCharacteristic: (address, value) =>
+      track('writeCharacteristic', address.deviceId, () =>
+        adapter.writeCharacteristic(address, value)
+      ),
+    subscribeNotification: (address, onValue) =>
+      track('setNotification', address.deviceId, () =>
+        adapter.subscribeNotification(address, onValue)
+      ),
+  }
+}
+
+export const createFaultInjectionAdapter = (
+  adapter: BleConnectionAdapter,
+  policy: BleFaultInjectionPolicy
+): BleConnectionAdapter => {
+  const remainingFailures = new Map<BleGattOpName, number>()
+
+  const runWithFault = async <T>(
+    opName: BleGattOpName,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    const rule = policy[opName]
+    if (rule?.delayMs != null && rule.delayMs > 0) {
+      await sleep(rule.delayMs)
+    }
+
+    const configuredFailures = rule?.failTimes ?? 0
+    const left = remainingFailures.get(opName) ?? configuredFailures
+    if (left > 0) {
+      remainingFailures.set(opName, left - 1)
+      throw new Error(rule?.failWith ?? `Injected ${opName} failure`)
+    }
+    return operation()
+  }
+
+  return {
+    connect: (deviceId) => runWithFault('connect', () => adapter.connect(deviceId)),
+    disconnect: (deviceId) => runWithFault('disconnect', () => adapter.disconnect(deviceId)),
+    discoverServices: (deviceId) =>
+      runWithFault('discoverServices', () => adapter.discoverServices(deviceId)),
+    readCharacteristic: (address) =>
+      runWithFault('readCharacteristic', () => adapter.readCharacteristic(address)),
+    writeCharacteristic: (address, value) =>
+      runWithFault('writeCharacteristic', () =>
+        adapter.writeCharacteristic(address, value)
+      ),
+    subscribeNotification: (address, onValue) =>
+      runWithFault('setNotification', () =>
+        adapter.subscribeNotification(address, onValue)
+      ),
+  }
 }

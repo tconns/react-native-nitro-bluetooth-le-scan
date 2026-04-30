@@ -112,6 +112,64 @@ async function demo() {
 - `rankDevices(devices, weights?): BleScanResult[]`
 - `registerManufacturerParser(parser): void`
 - `unregisterManufacturerParser(parserId): void`
+- `createGattOperationQueue(): { enqueue(deviceId, op), clear(deviceId?) }`
+- `createInstrumentedConnectionAdapter(adapter, onMetric): BleConnectionAdapter`
+- `createFaultInjectionAdapter(adapter, policy): BleConnectionAdapter`
+- `createRuntimeHealthMonitor(): BleRuntimeHealthMonitor`
+
+### Phase 4 utilities (operation safety + telemetry)
+
+Use queue + metrics to keep one in-flight GATT op per device and observe latency/failures:
+
+```ts
+import {
+  createGattOperationQueue,
+  createInstrumentedConnectionAdapter,
+  discoverServicesWithCache,
+} from 'react-native-nitro-bluetooth-le-scan'
+
+const queue = createGattOperationQueue()
+const instrumented = createInstrumentedConnectionAdapter(adapter, (metric) => {
+  console.log('[ble-op]', metric.opName, metric.deviceId, metric.elapsedMs, metric.success)
+})
+
+await queue.enqueue(deviceId, () => instrumented.connect(deviceId))
+const services = await queue.enqueue(deviceId, () =>
+  discoverServicesWithCache(instrumented, deviceId)
+)
+```
+
+Inject deterministic failures/delays for QA:
+
+```ts
+import {createFaultInjectionAdapter} from 'react-native-nitro-bluetooth-le-scan'
+
+const qaAdapter = createFaultInjectionAdapter(adapter, {
+  connect: {failTimes: 1, failWith: 'simulated connect failure'},
+  discoverServices: {delayMs: 1200},
+})
+```
+
+Aggregate runtime quality for scan/connection sessions:
+
+```ts
+import {
+  createInstrumentedConnectionAdapter,
+  createRuntimeHealthMonitor,
+  subscribeBleScan,
+} from 'react-native-nitro-bluetooth-le-scan'
+
+const monitor = createRuntimeHealthMonitor()
+const instrumented = createInstrumentedConnectionAdapter(adapter, (metric) => {
+  monitor.onGattMetric(metric)
+})
+
+const unsubscribe = subscribeBleScan((event) => monitor.onScanEvent(event))
+const report = monitor.getReport()
+const trace = monitor.getTrace(50) // latest 50 entries (scan events + gatt metrics)
+console.log(report.scan, report.connection)
+unsubscribe()
+```
 
 ### Event types
 

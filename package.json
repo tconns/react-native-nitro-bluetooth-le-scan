@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-bluetooth-le-scan",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Nitro-powered BLE scanner for React Native.",
   "main": "lib/index",
   "module": "lib/index",

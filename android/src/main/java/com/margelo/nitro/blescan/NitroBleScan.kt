@@ -27,6 +27,7 @@ import kotlin.math.roundToInt
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
@@ -60,6 +61,8 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private val writeResultByKey = ConcurrentHashMap<String, Boolean>()
   private val notifyLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
   private val notifyResultByKey = ConcurrentHashMap<String, Boolean>()
+  private val connectTokenByDeviceId = ConcurrentHashMap<String, Long>()
+  private val operationScheduler = Executors.newSingleThreadScheduledExecutor()
   private val classicReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: android.content.Context?, intent: Intent?) {
       try {
@@ -229,9 +232,12 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     val adapter = bluetoothManager.adapter ?: return false
     val timeoutMs = parseConfigLong(optionsJson, "timeoutMs", 10000L).coerceIn(1000L, 30000L)
     return try {
+      val currentState = connectionStateByDeviceId[deviceId]
+      if (currentState == "connecting" || currentState == "connected") {
+        emitWarning("BLE_CONNECT_IN_PROGRESS", "Connect already in progress for $deviceId.", "Wait for connection event.")
+        return true
+      }
       val device = adapter.getRemoteDevice(deviceId)
-      val latch = CountDownLatch(1)
-      connectLatchByDeviceId[deviceId] = latch
       synchronized(stateLock) {
         connectionStateByDeviceId[deviceId] = "connecting"
         emitConnectionState(deviceId, "connecting")
@@ -244,18 +250,35 @@ class NitroBleScan : HybridNitroBleScanSpec() {
         }
       if (gatt == null) {
         emitError("BLE_CONNECT_FAILED", "connectGatt returned null.", "Retry connect.")
-        connectLatchByDeviceId.remove(deviceId)
         return false
       }
       gattByDeviceId[deviceId] = gatt
-      val ok = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
-      connectLatchByDeviceId.remove(deviceId)
-      if (!ok || connectionStateByDeviceId[deviceId] != "connected") {
-        emitError("BLE_CONNECT_TIMEOUT", "Connect timed out for $deviceId.", "Retry or move closer to peripheral.")
-        false
-      } else {
-        true
-      }
+      val token = nowMs()
+      connectTokenByDeviceId[deviceId] = token
+      operationScheduler.schedule({
+        synchronized(stateLock) {
+          val stillSameAttempt = connectTokenByDeviceId[deviceId] == token
+          val stillConnecting = connectionStateByDeviceId[deviceId] == "connecting"
+          if (!stillSameAttempt || !stillConnecting) return@synchronized
+          connectTokenByDeviceId.remove(deviceId)
+          connectionStateByDeviceId[deviceId] = "disconnected"
+          emitConnectionState(deviceId, "disconnected")
+          gattByDeviceId.remove(deviceId)?.let { pendingGatt ->
+            try {
+              pendingGatt.disconnect()
+            } catch (_: Throwable) {
+              // no-op
+            }
+            try {
+              pendingGatt.close()
+            } catch (_: Throwable) {
+              // no-op
+            }
+          }
+          emitError("BLE_CONNECT_TIMEOUT", "Connect timed out for $deviceId.", "Retry or move closer to peripheral.")
+        }
+      }, timeoutMs, TimeUnit.MILLISECONDS)
+      true
     } catch (error: Throwable) {
       emitError("BLE_CONNECT_FAILED", "Failed to connect $deviceId.", "Retry connection.", error.message)
       false
@@ -408,11 +431,13 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       synchronized(stateLock) {
         val deviceId = gatt.device?.address ?: return
         if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+          connectTokenByDeviceId.remove(deviceId)
           connectionStateByDeviceId[deviceId] = "connected"
           emitConnectionState(deviceId, "connected")
           connectLatchByDeviceId.remove(deviceId)?.countDown()
           return
         }
+        connectTokenByDeviceId.remove(deviceId)
         connectionStateByDeviceId[deviceId] = "disconnected"
         emitConnectionState(deviceId, "disconnected")
         connectLatchByDeviceId.remove(deviceId)?.countDown()

@@ -39,6 +39,9 @@ export {
   writeBleCharacteristic,
 } from './runtime'
 export {
+  createFaultInjectionAdapter,
+  createGattOperationQueue,
+  createInstrumentedConnectionAdapter,
   createConnectionStateGuard,
   createDiscoveryCache,
   createNotificationManager,
@@ -50,3 +53,18 @@ export {
   withTimeout,
   writeWithRetry,
 } from './connectionUtils'
+export type {
+  BleFaultInjectionPolicy,
+  BleGattOpMetric,
+  BleGattOpName,
+} from './connectionUtils'
+export {
+  createRuntimeHealthMonitor,
+} from './observability'
+export type {
+  BleConnectionHealthSummary,
+  BleRuntimeHealthMonitor,
+  BleRuntimeHealthReport,
+  BleRuntimeTraceEntry,
+  BleScanHealthSummary,
+} from './observability'

@@ -91,6 +91,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
   private var rankingWeights = RankingWeights()
   private var discoveredPeripherals: [String: CBPeripheral] = [:]
   private var connectedPeripherals: [String: CBPeripheral] = [:]
+  private var connectionStateById: [String: String] = [:]
   private var serviceCache: [String: String] = [:]
   private var connectSemaphoreById: [String: DispatchSemaphore] = [:]
   private var connectResultById: [String: Bool] = [:]
@@ -192,6 +193,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
   func connect(deviceId: String, optionsJson: String) -> Bool {
     stateLock.lock()
     let peripheral = discoveredPeripherals[deviceId] ?? connectedPeripherals[deviceId]
+    let currentState = connectionStateById[deviceId]
     stateLock.unlock()
     guard let peripheral else {
       emitIssue(
@@ -203,41 +205,54 @@ class NitroBleScan: HybridNitroBleScanSpec {
       )
       return false
     }
+    if currentState == "connecting" || currentState == "connected" {
+      emitIssue(
+        type: "warning",
+        code: "BLE_CONNECT_IN_PROGRESS",
+        message: "Connect already in progress.",
+        recoveryHint: "Wait for connection event.",
+        platformDetails: "deviceId=\(deviceId)"
+      )
+      return true
+    }
     peripheral.delegate = peripheralDelegate
     let timeoutMs = parseLong(optionsJson, key: "timeoutMs", fallback: 10000)
-    let semaphore = DispatchSemaphore(value: 0)
     stateLock.lock()
-    connectSemaphoreById[deviceId] = semaphore
-    connectResultById[deviceId] = false
+    connectionStateById[deviceId] = "connecting"
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "connecting"])
     stateLock.unlock()
     centralManager.connect(peripheral, options: nil)
-    let waitResult = semaphore.wait(timeout: .now() + .milliseconds(Int(timeoutMs)))
-    stateLock.lock()
-    connectSemaphoreById[deviceId] = nil
-    let result = connectResultById[deviceId] ?? false
-    stateLock.unlock()
-    if waitResult == .timedOut {
-      emitIssue(
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(Int(timeoutMs))) { [weak self] in
+      guard let self else { return }
+      self.stateLock.lock()
+      defer { self.stateLock.unlock() }
+      guard self.connectionStateById[deviceId] == "connecting" else { return }
+      self.connectionStateById[deviceId] = "disconnected"
+      self.connectedPeripherals[deviceId] = nil
+      self.serviceCache[deviceId] = nil
+      self.centralManager.cancelPeripheralConnection(peripheral)
+      self.emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "disconnected"])
+      self.emitIssue(
         type: "error",
         code: "BLE_CONNECT_TIMEOUT",
         message: "Connect timed out.",
         recoveryHint: "Retry or move closer to peripheral.",
         platformDetails: "deviceId=\(deviceId)"
       )
-      return false
     }
-    return result
+    return true
   }
 
   func disconnect(deviceId: String) -> Bool {
     stateLock.lock()
     defer { stateLock.unlock() }
     guard let peripheral = connectedPeripherals[deviceId] else { return true }
+    connectionStateById[deviceId] = "disconnecting"
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "disconnecting"])
     centralManager.cancelPeripheralConnection(peripheral)
     connectedPeripherals[deviceId] = nil
     serviceCache[deviceId] = nil
+    connectionStateById[deviceId] = "disconnected"
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": deviceId, "state": "disconnected"])
     return true
   }
@@ -419,6 +434,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
     let id = peripheral.identifier.uuidString
     peripheral.delegate = peripheralDelegate
     connectedPeripherals[id] = peripheral
+    connectionStateById[id] = "connected"
     connectResultById[id] = true
     connectSemaphoreById[id]?.signal()
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "connected"])
@@ -428,6 +444,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
     stateLock.lock()
     defer { stateLock.unlock() }
     let id = peripheral.identifier.uuidString
+    connectionStateById[id] = "disconnected"
     connectResultById[id] = false
     connectSemaphoreById[id]?.signal()
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "disconnected"])
@@ -444,6 +461,7 @@ class NitroBleScan: HybridNitroBleScanSpec {
     stateLock.lock()
     defer { stateLock.unlock() }
     let id = peripheral.identifier.uuidString
+    connectionStateById[id] = "disconnected"
     connectedPeripherals[id] = nil
     serviceCache[id] = nil
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "disconnected"])
