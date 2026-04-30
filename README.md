@@ -1,32 +1,32 @@
 # react-native-nitro-bluetooth-le-scan
 
-Nitro-powered Bluetooth scanning and connection toolkit for React Native.
+High-performance, Nitro-powered Bluetooth runtime for React Native.
 
-`react-native-nitro-bluetooth-le-scan` helps teams ship Bluetooth features that survive real production traffic, permission edge cases, and platform differences. It combines native execution speed with a typed JS runtime, observability primitives, and practical DX tooling.
+`react-native-nitro-bluetooth-le-scan` is built for teams shipping latency-sensitive Bluetooth workloads where throughput, determinism, and production operability matter. It combines native execution paths, typed runtime contracts, event-driven GATT orchestration, and observability primitives that turn field failures into actionable diagnostics.
 
 ## Value In 30 Seconds
 
 If you need React Native Bluetooth that is:
 
-- **stable** under noisy scan conditions,
-- **predictable** across Android/iOS,
-- **debuggable** with quality metrics and traces,
-- **extensible** for scanner, GATT, and product-specific workflows,
+- **high-throughput** under noisy RF environments,
+- **predictable** across Android/iOS lifecycle differences,
+- **observable** with operation-level metrics and traces,
+- **extensible** for scanner, GATT, and domain-specific workflows,
 
 this module is designed for that exact outcome.
 
-Design priority: `Reliability > Performance > API clarity > DX`.
+Design priority: `Performance + Reliability > API clarity > DX`.
 
 ## Why This Is Different
 
-Most BLE integrations break at scale because they focus only on happy-path scanning. This library explicitly addresses:
+Most BLE integrations degrade at scale because they optimize only happy-path demos. This library explicitly addresses:
 
 - permission and adapter-state complexity,
-- event storm/backpressure behavior,
-- connect/discover/read/write sequencing risks,
-- production incident debugging with insufficient telemetry.
+- event storm/backpressure control,
+- GATT sequencing and in-flight contention risks,
+- production incident forensics with insufficient telemetry.
 
-New in `0.7.x`: GATT `discover/read/write/notify` now use a fully event-driven native pipeline (no native blocking wait), while keeping Promise-based JS APIs for app ergonomics.
+New in `1.0.0`: GATT `discover/read/write/notify` now run through a fully event-driven native pipeline (no blocking waits), while preserving Promise-based JS ergonomics.
 
 ## Feature Matrix By Phase
 
@@ -37,6 +37,18 @@ New in `0.7.x`: GATT `discover/read/write/notify` now use a fully event-driven n
 | 3 | Connection-ready | Connect/disconnect, service discovery, read/write, notification toggles |
 | 4 | Hardening | Non-blocking connect, op queue, instrumentation, QA fault injection, health report + trace |
 | 5 | DX moat | React hooks, scaffold command, diagnostics command, cookbook recipes |
+
+## Performance Architecture
+
+This module is tuned for production Bluetooth workloads, not demo-path behavior.
+
+- **Event-driven native GATT:** callback-driven completion removes blocking waits from the operation hot path.
+- **Per-device serialization:** queued execution prevents race amplification and lowers retry churn.
+- **Backpressure-aware scan flow:** dedupe + coalescing reduce JS bridge noise in dense RF environments.
+- **Deterministic lifecycle cleanup:** explicit dispose semantics reduce long-tail memory retention.
+- **Observable runtime pressure:** pending counters, health reports, and traces expose contention early.
+
+Expected outcome: tighter latency distribution, reduced UI stall risk, and cleaner recovery behavior under load.
 
 ## Requirements
 
@@ -274,12 +286,12 @@ const unsubscribe = subscribeBleScan((event) => {
 
 ### Path C: Production-Safe Flow
 
-Use this in production apps where race safety and telemetry matter.
+Use this in production apps where throughput, race safety, and telemetry matter.
 
 Step flow:
 
 1. Serialize per-device GATT operations with queue.
-2. Instrument operation metrics.
+2. Instrument operation latency and outcome metrics.
 3. Feed metrics/events into health monitor.
 4. Persist report/trace in QA incident logs.
 
@@ -413,7 +425,7 @@ const report = monitor.getReport()
 const trace = monitor.getTrace(50)
 ```
 
-Use `report` for health KPIs (attempts, failures, latency, warnings/errors) and `trace` for sequence-level incident evidence.
+Use `report` for runtime KPIs (attempts, failures, latency, warnings/errors) and `trace` for sequence-level incident evidence.
 
 Lifecycle hardening rules:
 
@@ -532,12 +544,13 @@ Fix now:
 
 Likely cause:
 
-- too many in-flight actions per device or missing per-device serialization
+- queue pressure growth per device, or missing per-device serialization
 
 Fix now:
 
 - run GATT operations through `createGattOperationQueue()`
-- inspect `pendingOperationCount` in snapshot and include it in diagnostics
+- inspect `pendingOperationCount` and `pendingOperationDeviceCount` in snapshot
+- capture `report + trace` during high-load sessions to isolate contention patterns
 
 ### Symptom: GATT Promise never resolves after app teardown/navigation reset
 
