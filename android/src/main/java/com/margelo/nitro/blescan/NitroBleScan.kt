@@ -1,0 +1,518 @@
+package com.margelo.nitro.blescan
+
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.location.LocationManager
+import android.os.Build
+import androidx.core.content.ContextCompat
+import com.facebook.proguard.annotations.DoNotStrip
+import com.margelo.nitro.NitroModules
+import org.json.JSONArray
+import org.json.JSONObject
+
+@DoNotStrip
+class NitroBleScan : HybridNitroBleScanSpec() {
+  private val context = NitroModules.applicationContext
+    ?: throw IllegalStateException("NitroModules.applicationContext is null")
+  private val bluetoothManager =
+    context.getSystemService(android.content.Context.BLUETOOTH_SERVICE) as BluetoothManager
+  private val stateLock = Any()
+  private var scanner: BluetoothLeScanner? = null
+  private var scanCallback: ScanCallback? = null
+  private var listener: ((String) -> Unit)? = null
+  private var classicReceiverRegistered = false
+  private var classicDiscoveryEnabled = true
+  private var coalescingWindowMs = 150L
+  private val lastSeenById = HashMap<String, Long>()
+  private val classicReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: android.content.Context?, intent: Intent?) {
+      if (intent == null) return
+      when (intent.action) {
+        BluetoothDevice.ACTION_FOUND -> {
+          val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+          val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
+          if (device != null) {
+            onClassicDeviceFound(device, rssi.toInt())
+          }
+        }
+        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+          synchronized(stateLock) {
+            if (snapshot.isScanning && classicDiscoveryEnabled) {
+              val adapter = bluetoothManager.adapter
+              if (adapter != null && adapter.isEnabled) {
+                try {
+                  adapter.startDiscovery()
+                } catch (_: Throwable) {
+                  emitWarning(
+                    "BLE_CLASSIC_RESTART_FAILED",
+                    "Classic discovery stopped unexpectedly.",
+                    "Retry scan or toggle Bluetooth."
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private val snapshot = SnapshotState(
+    isScanning = false,
+    adapterState = adapterStateString(),
+    lastStartTs = 0L,
+    lastStopTs = 0L,
+    seenDeviceCount = 0,
+    eventsEmitted = 0,
+    eventsDropped = 0,
+    coalescedCount = 0,
+    lastErrorCode = null
+  )
+
+  private data class SnapshotState(
+    var isScanning: Boolean,
+    var adapterState: String,
+    var lastStartTs: Long,
+    var lastStopTs: Long,
+    var seenDeviceCount: Int,
+    var eventsEmitted: Int,
+    var eventsDropped: Int,
+    var coalescedCount: Int,
+    var lastErrorCode: String?
+  )
+
+  override fun getAdapterState(): String {
+    synchronized(stateLock) {
+      snapshot.adapterState = adapterStateString()
+      return snapshot.adapterState
+    }
+  }
+
+  override fun ensurePermissions(): Boolean = hasScanPermission()
+
+  override fun startScan(configJson: String): Boolean {
+    synchronized(stateLock) {
+      if (snapshot.isScanning) {
+        emitWarning("BLE_ALREADY_SCANNING", "Scan already running", "Call stopScan() before restarting scan.")
+        return true
+      }
+      if (!hasScanPermission()) {
+        emitError("BLE_PERMISSION_DENIED", "Required BLE permissions are missing.", "Request runtime permissions before calling startScan().")
+        return false
+      }
+      if (adapterStateString() != "poweredOn") {
+        emitError("BLE_ADAPTER_OFF", "Bluetooth adapter is not powered on.", "Enable Bluetooth, then retry.")
+        return false
+      }
+      val adapter = bluetoothManager.adapter ?: run {
+        emitError("BLE_UNSUPPORTED", "Bluetooth adapter is unavailable.", "Run this feature on a BLE-capable device.")
+        return false
+      }
+      scanner = adapter.bluetoothLeScanner ?: run {
+        emitError("BLE_SCANNER_UNAVAILABLE", "Bluetooth LE scanner is unavailable.", "Retry after enabling Bluetooth.")
+        return false
+      }
+      val settings = buildScanSettings(configJson)
+      val filters = buildScanFilters(configJson)
+      coalescingWindowMs = parseConfigLong(configJson, "coalescingWindowMs", 150L).coerceAtLeast(0L)
+      classicDiscoveryEnabled = parseConfigBoolean(configJson, "enableClassicDiscovery", true)
+      lastSeenById.clear()
+      snapshot.seenDeviceCount = 0
+      scanCallback = createScanCallback()
+      var startedAnyScan = false
+      try {
+        scanner?.startScan(filters, settings, scanCallback)
+        startedAnyScan = true
+      } catch (error: Throwable) {
+        emitError("BLE_SCAN_FAILED", "Failed to start BLE scan.", "Check permission, adapter state, and retry.", error.message)
+      }
+      if (classicDiscoveryEnabled) {
+        startedAnyScan = startClassicDiscovery(adapter) || startedAnyScan
+      }
+      if (startedAnyScan) {
+        snapshot.isScanning = true
+        snapshot.lastStartTs = nowMs()
+        snapshot.adapterState = adapterStateString()
+        emitSimpleEvent("scanStarted")
+      } else {
+        emitError("BLE_SCAN_FAILED", "No scan transport could be started.", "Check Bluetooth state and app permissions.")
+      }
+      return startedAnyScan
+    }
+  }
+
+  override fun stopScan(): Boolean {
+    synchronized(stateLock) {
+      if (!snapshot.isScanning) {
+        emitWarning("BLE_NOT_SCANNING", "stopScan() called while scanner is idle.", "This call is safe to ignore.")
+        return true
+      }
+      try {
+        scanCallback?.let { cb -> scanner?.stopScan(cb) }
+      } catch (_: Throwable) {
+        // best effort stop
+      }
+      stopClassicDiscovery()
+      scanCallback = null
+      scanner = null
+      snapshot.isScanning = false
+      snapshot.lastStopTs = nowMs()
+      snapshot.adapterState = adapterStateString()
+      emitSimpleEvent("scanStopped", "manualStop")
+      return true
+    }
+  }
+
+  override fun getSnapshot(): String {
+    synchronized(stateLock) {
+      snapshot.adapterState = adapterStateString()
+      return JSONObject().apply {
+        put("isScanning", snapshot.isScanning)
+        put("adapterState", snapshot.adapterState)
+        if (snapshot.lastStartTs > 0L) put("lastStartTs", snapshot.lastStartTs)
+        if (snapshot.lastStopTs > 0L) put("lastStopTs", snapshot.lastStopTs)
+        put("seenDeviceCount", snapshot.seenDeviceCount)
+        put("eventsEmitted", snapshot.eventsEmitted)
+        put("eventsDropped", snapshot.eventsDropped)
+        put("coalescedCount", snapshot.coalescedCount)
+        if (snapshot.lastErrorCode != null) put("lastErrorCode", snapshot.lastErrorCode)
+      }.toString()
+    }
+  }
+
+  override fun setEventListener(listener: (String) -> Unit) {
+    synchronized(stateLock) {
+      this.listener = listener
+    }
+  }
+
+  private fun createScanCallback(): ScanCallback {
+    return object : ScanCallback() {
+      override fun onScanResult(callbackType: Int, result: ScanResult?) {
+        if (result != null) onDeviceFound(result)
+      }
+
+      override fun onBatchScanResults(results: MutableList<ScanResult>?) {
+        results?.forEach(::onDeviceFound)
+      }
+
+      override fun onScanFailed(errorCode: Int) {
+        synchronized(stateLock) {
+          snapshot.eventsDropped += 1
+          snapshot.lastErrorCode = "BLE_SCAN_FAILED_$errorCode"
+          emitError(
+            "BLE_SCAN_FAILED",
+            "BLE scan failed with Android error code $errorCode.",
+            "Stop scanning, verify permissions and adapter state, then retry.",
+            "androidErrorCode=$errorCode"
+          )
+          if (snapshot.isScanning) {
+            snapshot.isScanning = false
+            snapshot.lastStopTs = nowMs()
+            emitSimpleEvent("scanStopped", "scanFailed")
+          }
+        }
+      }
+    }
+  }
+
+  private fun onDeviceFound(result: ScanResult) {
+    synchronized(stateLock) {
+      val device = result.device ?: return
+      val deviceId = device.address ?: return
+      val now = nowMs()
+      val lastSeen = lastSeenById[deviceId]
+      if (lastSeen != null && now - lastSeen < coalescingWindowMs) {
+        snapshot.coalescedCount += 1
+        return
+      }
+      lastSeenById[deviceId] = now
+      snapshot.seenDeviceCount = lastSeenById.size
+      val payload = JSONObject().apply {
+        put("id", deviceId)
+        put("transport", "ble")
+        put("name", device.name ?: result.scanRecord?.deviceName)
+        put("rssi", result.rssi)
+        put("timestampMs", now)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+          put("txPower", result.txPower)
+          put("isConnectable", result.isConnectable)
+        }
+        val uuids = JSONArray()
+        result.scanRecord?.serviceUuids?.forEach { uuids.put(it.uuid.toString()) }
+        put("serviceUuids", uuids)
+      }
+      val event = JSONObject().apply {
+        put("type", "deviceFound")
+        put("ts", now)
+        put("payload", payload)
+      }
+      emitRawEvent(event)
+    }
+  }
+
+  private fun onClassicDeviceFound(device: BluetoothDevice, rssi: Int) {
+    synchronized(stateLock) {
+      val deviceId = device.address ?: return
+      val now = nowMs()
+      val lastSeen = lastSeenById[deviceId]
+      if (lastSeen != null && now - lastSeen < coalescingWindowMs) {
+        snapshot.coalescedCount += 1
+        return
+      }
+      lastSeenById[deviceId] = now
+      snapshot.seenDeviceCount = lastSeenById.size
+      val payload = JSONObject().apply {
+        put("id", deviceId)
+        put("transport", "classic")
+        put("name", device.name)
+        put("rssi", rssi)
+        put("timestampMs", now)
+      }
+      val event = JSONObject().apply {
+        put("type", "deviceFound")
+        put("ts", now)
+        put("payload", payload)
+      }
+      emitRawEvent(event)
+    }
+  }
+
+  private fun emitSimpleEvent(type: String, reason: String? = null) {
+    val event = JSONObject().apply {
+      put("type", type)
+      put("ts", nowMs())
+      if (reason != null) put("reason", reason)
+    }
+    emitRawEvent(event)
+  }
+
+  private fun emitWarning(code: String, message: String, recoveryHint: String? = null) {
+    emitIssue("warning", code, message, recoveryHint, null)
+  }
+
+  private fun emitError(code: String, message: String, recoveryHint: String? = null, platformDetails: String? = null) {
+    snapshot.lastErrorCode = code
+    emitIssue("error", code, message, recoveryHint, platformDetails)
+  }
+
+  private fun emitIssue(
+    type: String,
+    code: String,
+    message: String,
+    recoveryHint: String?,
+    platformDetails: String?
+  ) {
+    val event = JSONObject().apply {
+      put("type", type)
+      put("ts", nowMs())
+      put("payload", JSONObject().apply {
+        put("code", code)
+        put("message", message)
+        if (recoveryHint != null) put("recoveryHint", recoveryHint)
+        if (platformDetails != null) put("platformDetails", platformDetails)
+      })
+    }
+    emitRawEvent(event)
+  }
+
+  private fun emitRawEvent(event: JSONObject) {
+    listener?.let {
+      try {
+        it(event.toString())
+        snapshot.eventsEmitted += 1
+      } catch (_: Throwable) {
+        snapshot.eventsDropped += 1
+      }
+    } ?: run {
+      snapshot.eventsDropped += 1
+    }
+  }
+
+  private fun buildScanSettings(configJson: String): ScanSettings {
+    val mode = parseConfigString(configJson, "mode", "balanced")
+    val reportDelay = parseConfigLong(configJson, "reportDelayMs", 0L).coerceAtLeast(0L)
+    val androidMode = when (mode) {
+      "lowLatency" -> ScanSettings.SCAN_MODE_LOW_LATENCY
+      "lowPower" -> ScanSettings.SCAN_MODE_LOW_POWER
+      else -> ScanSettings.SCAN_MODE_BALANCED
+    }
+    return ScanSettings.Builder()
+      .setScanMode(androidMode)
+      .setReportDelay(reportDelay)
+      .build()
+  }
+
+  private fun buildScanFilters(configJson: String): List<ScanFilter> {
+    val filters = mutableListOf<ScanFilter>()
+    try {
+      val root = JSONObject(configJson)
+      val arr = root.optJSONArray("filters") ?: return emptyList()
+      for (i in 0 until arr.length()) {
+        val item = arr.optJSONObject(i) ?: continue
+        val builder = ScanFilter.Builder()
+        item.optString("namePrefix").takeIf { it.isNotBlank() }?.let(builder::setDeviceName)
+        filters += builder.build()
+      }
+    } catch (_: Throwable) {
+      return emptyList()
+    }
+    return filters
+  }
+
+  private fun parseConfigString(configJson: String, key: String, fallback: String): String {
+    return try {
+      JSONObject(configJson).optString(key, fallback)
+    } catch (_: Throwable) {
+      fallback
+    }
+  }
+
+  private fun parseConfigLong(configJson: String, key: String, fallback: Long): Long {
+    return try {
+      JSONObject(configJson).optLong(key, fallback)
+    } catch (_: Throwable) {
+      fallback
+    }
+  }
+
+  private fun parseConfigBoolean(configJson: String, key: String, fallback: Boolean): Boolean {
+    return try {
+      JSONObject(configJson).optBoolean(key, fallback)
+    } catch (_: Throwable) {
+      fallback
+    }
+  }
+
+  private fun startClassicDiscovery(adapter: BluetoothAdapter): Boolean {
+    if (!hasClassicPermission()) {
+      emitWarning(
+        "BLE_CLASSIC_PERMISSION_DENIED",
+        "Missing permission for classic Bluetooth discovery.",
+        "Grant Location permission and retry."
+      )
+      return false
+    }
+    if (!isLocationServiceEnabled()) {
+      emitWarning(
+        "BLE_CLASSIC_LOCATION_DISABLED",
+        "Location service is disabled, classic discovery may fail.",
+        "Enable Location service (GPS) and retry."
+      )
+    }
+    try {
+      if (!classicReceiverRegistered) {
+        val filter = IntentFilter().apply {
+          addAction(BluetoothDevice.ACTION_FOUND)
+          addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+        context.registerReceiver(classicReceiver, filter)
+        classicReceiverRegistered = true
+      }
+      if (adapter.isDiscovering) {
+        adapter.cancelDiscovery()
+      }
+      val started = adapter.startDiscovery()
+      if (!started) {
+        emitWarning(
+          "BLE_CLASSIC_START_FAILED",
+          "Failed to start classic Bluetooth discovery. adapterOn=${adapter.isEnabled} discovering=${adapter.isDiscovering}",
+          "Ensure Bluetooth is enabled and try again."
+        )
+      }
+      return started
+    } catch (error: Throwable) {
+      emitWarning(
+        "BLE_CLASSIC_START_FAILED",
+        "Classic Bluetooth discovery is unavailable. ${error.message ?: ""}".trim(),
+        "Continue with BLE-only scan."
+      )
+      return false
+    }
+  }
+
+  private fun stopClassicDiscovery() {
+    val adapter = bluetoothManager.adapter
+    try {
+      if (adapter?.isDiscovering == true) {
+        adapter.cancelDiscovery()
+      }
+    } catch (_: Throwable) {
+      // no-op
+    }
+    if (classicReceiverRegistered) {
+      try {
+        context.unregisterReceiver(classicReceiver)
+      } catch (_: Throwable) {
+        // no-op
+      }
+      classicReceiverRegistered = false
+    }
+  }
+
+  private fun hasScanPermission(): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      val scan = ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+      val connect = ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+      return scan && connect
+    }
+    return ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+  }
+
+  private fun hasClassicPermission(): Boolean {
+    return ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+  }
+
+  private fun isLocationServiceEnabled(): Boolean {
+    return try {
+      val manager = context.getSystemService(android.content.Context.LOCATION_SERVICE) as LocationManager
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        manager.isLocationEnabled
+      } else {
+        manager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+          manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+      }
+    } catch (_: Throwable) {
+      true
+    }
+  }
+
+  private fun adapterStateString(): String {
+    val adapter: BluetoothAdapter = bluetoothManager.adapter ?: return "unsupported"
+    return when (adapter.state) {
+      BluetoothAdapter.STATE_OFF -> "poweredOff"
+      BluetoothAdapter.STATE_ON -> "poweredOn"
+      BluetoothAdapter.STATE_TURNING_ON -> "resetting"
+      BluetoothAdapter.STATE_TURNING_OFF -> "resetting"
+      else -> "unknown"
+    }
+  }
+
+  private fun nowMs(): Long = System.currentTimeMillis()
+
+  protected fun finalize() {
+    synchronized(stateLock) {
+      try {
+        scanCallback?.let { cb -> scanner?.stopScan(cb) }
+      } catch (_: Throwable) {
+        // no-op
+      }
+      stopClassicDiscovery()
+      scanCallback = null
+      scanner = null
+      snapshot.isScanning = false
+      listener = null
+    }
+  }
+}
