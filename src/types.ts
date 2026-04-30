@@ -105,3 +105,47 @@ export type ManufacturerParser = {
   canParse: (result: BleScanResult) => boolean
   parse: (result: BleScanResult) => unknown
 }
+
+export type BleConnectionState =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'disconnecting'
+  | 'disconnected'
+
+export type BleConnectionOptions = {
+  timeoutMs?: number
+}
+
+export type BleRetryPolicy = {
+  maxAttempts?: number
+  initialDelayMs?: number
+  maxDelayMs?: number
+  backoffFactor?: number
+}
+
+export type BleGattCharacteristicAddress = {
+  deviceId: string
+  serviceUuid: string
+  characteristicUuid: string
+}
+
+export type BleGattService = {
+  uuid: string
+  characteristicUuids: string[]
+}
+
+export type BleConnectionAdapter = {
+  connect: (deviceId: string) => Promise<void>
+  disconnect: (deviceId: string) => Promise<void>
+  discoverServices: (deviceId: string) => Promise<BleGattService[]>
+  readCharacteristic: (address: BleGattCharacteristicAddress) => Promise<number[]>
+  writeCharacteristic: (
+    address: BleGattCharacteristicAddress,
+    value: number[]
+  ) => Promise<void>
+  subscribeNotification: (
+    address: BleGattCharacteristicAddress,
+    onValue: (value: number[]) => void
+  ) => Promise<() => void>
+}

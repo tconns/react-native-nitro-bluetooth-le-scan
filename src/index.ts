@@ -1,7 +1,13 @@
 export type {
+  BleConnectionAdapter,
+  BleConnectionOptions,
+  BleConnectionState,
+  BleGattCharacteristicAddress,
+  BleGattService,
   BleScanAdapterState,
   BleDedupeMode,
   BleDistanceModel,
+  BleRetryPolicy,
   BleScanError,
   BleScanEvent,
   BleScanFilter,
@@ -26,3 +32,15 @@ export {
   subscribeBleScan,
   unregisterManufacturerParser,
 } from './runtime'
+export {
+  createConnectionStateGuard,
+  createDiscoveryCache,
+  createNotificationManager,
+  discoverServicesWithCache,
+  readWithRetry,
+  safeConnect,
+  safeDisconnect,
+  withRetry,
+  withTimeout,
+  writeWithRetry,
+} from './connectionUtils'
