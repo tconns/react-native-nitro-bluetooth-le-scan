@@ -93,17 +93,14 @@ class NitroBleScan: HybridNitroBleScanSpec {
   private var connectedPeripherals: [String: CBPeripheral] = [:]
   private var connectionStateById: [String: String] = [:]
   private var serviceCache: [String: String] = [:]
-  private var connectSemaphoreById: [String: DispatchSemaphore] = [:]
-  private var connectResultById: [String: Bool] = [:]
-  private var discoverSemaphoreById: [String: DispatchSemaphore] = [:]
-  private var discoverResultById: [String: String] = [:]
-  private var readSemaphoreByKey: [String: DispatchSemaphore] = [:]
-  private var readResultByKey: [String: [Int]] = [:]
-  private var writeSemaphoreByKey: [String: DispatchSemaphore] = [:]
-  private var writeResultByKey: [String: Bool] = [:]
-  private var notifySemaphoreByKey: [String: DispatchSemaphore] = [:]
-  private var notifyResultByKey: [String: Bool] = [:]
+  private var pendingGattByRequestId: [String: PendingGattRequest] = [:]
+  private var pendingTimeoutByRequestId: [String: DispatchWorkItem] = [:]
+  private var pendingDiscoverRequestByDeviceId: [String: String] = [:]
+  private var pendingReadRequestByKey: [String: String] = [:]
+  private var pendingWriteRequestByKey: [String: String] = [:]
+  private var pendingNotifyRequestByKey: [String: String] = [:]
   private var stateLock = NSLock()
+  private var isDisposed = false
   private var discoverOrder: [String] = []
   private let maxTrackedPeripherals = 256
   private let maxTrackedSeenDevices = 512
@@ -115,11 +112,34 @@ class NitroBleScan: HybridNitroBleScanSpec {
     var transport = 0.05
   }
 
+  private struct PendingGattRequest {
+    let requestId: String
+    let opName: String
+    let deviceId: String
+    let addressKey: String?
+  }
+
+  private struct GattOperationRequest {
+    let requestId: String
+    let opName: String
+    let deviceId: String
+    let address: CharacteristicAddress?
+    let value: [UInt8]?
+    let enable: Bool?
+    let timeoutMs: Int64
+  }
+
   override init() {
     super.init()
     centralDelegate = BleCentralDelegate(owner: self)
     peripheralDelegate = BlePeripheralDelegate(owner: self)
     centralManager = CBCentralManager(delegate: centralDelegate, queue: nil)
+  }
+
+  deinit {
+    stateLock.lock()
+    cleanupResourcesLocked()
+    stateLock.unlock()
   }
 
   func getAdapterState() -> String {
@@ -263,100 +283,83 @@ class NitroBleScan: HybridNitroBleScanSpec {
     return true
   }
 
-  func discoverServices(deviceId: String) -> String {
+  func submitGattOperation(operationJson: String) -> Bool {
+    guard let op = parseGattOperation(operationJson) else { return false }
     stateLock.lock()
-    if let cached = serviceCache[deviceId] {
-      stateLock.unlock()
-      return cached
-    }
-    guard let peripheral = connectedPeripherals[deviceId] else {
-      stateLock.unlock()
-      return "[]"
-    }
-    let semaphore = DispatchSemaphore(value: 0)
-    discoverSemaphoreById[deviceId] = semaphore
-    discoverResultById[deviceId] = "[]"
-    stateLock.unlock()
-    peripheral.discoverServices(nil)
-    let waitResult = semaphore.wait(timeout: .now() + .seconds(8))
-    stateLock.lock()
-    discoverSemaphoreById[deviceId] = nil
-    let result = discoverResultById.removeValue(forKey: deviceId) ?? "[]"
-    stateLock.unlock()
-    if waitResult == .timedOut { return "[]" }
-    return result
-  }
-
-  func readCharacteristic(addressJson: String) -> String {
-    guard let address = parseAddress(addressJson) else { return "[]" }
-    stateLock.lock()
-    guard let peripheral = connectedPeripherals[address.deviceId],
-          let characteristic = findCharacteristic(peripheral: peripheral, address: address)
-    else {
-      stateLock.unlock()
-      return "[]"
-    }
-    let key = characteristicKey(address)
-    let semaphore = DispatchSemaphore(value: 0)
-    readSemaphoreByKey[key] = semaphore
-    readResultByKey[key] = []
-    stateLock.unlock()
-    peripheral.readValue(for: characteristic)
-    let waitResult = semaphore.wait(timeout: .now() + .seconds(8))
-    stateLock.lock()
-    readSemaphoreByKey[key] = nil
-    let result = readResultByKey.removeValue(forKey: key) ?? []
-    stateLock.unlock()
-    if waitResult == .timedOut { return "[]" }
-    return stringifyArray(result)
-  }
-
-  func writeCharacteristic(addressJson: String, valueJson: String) -> Bool {
-    guard let address = parseAddress(addressJson) else { return false }
-    stateLock.lock()
-    guard let peripheral = connectedPeripherals[address.deviceId],
-          let characteristic = findCharacteristic(peripheral: peripheral, address: address)
-    else {
+    guard let peripheral = connectedPeripherals[op.deviceId] else {
       stateLock.unlock()
       return false
     }
-    let key = characteristicKey(address)
-    let semaphore = DispatchSemaphore(value: 0)
-    writeSemaphoreByKey[key] = semaphore
-    writeResultByKey[key] = false
-    stateLock.unlock()
-    peripheral.writeValue(Data(parseByteArray(valueJson)), for: characteristic, type: .withResponse)
-    let waitResult = semaphore.wait(timeout: .now() + .seconds(8))
-    stateLock.lock()
-    writeSemaphoreByKey[key] = nil
-    let result = writeResultByKey.removeValue(forKey: key) ?? false
-    stateLock.unlock()
-    if waitResult == .timedOut { return false }
-    return result
-  }
-
-  func setCharacteristicNotification(addressJson: String, enable: Bool) -> Bool {
-    guard let address = parseAddress(addressJson) else { return false }
-    stateLock.lock()
-    guard let peripheral = connectedPeripherals[address.deviceId],
-          let characteristic = findCharacteristic(peripheral: peripheral, address: address)
-    else {
+    if pendingGattByRequestId[op.requestId] != nil {
       stateLock.unlock()
       return false
     }
-    let key = characteristicKey(address)
-    let semaphore = DispatchSemaphore(value: 0)
-    notifySemaphoreByKey[key] = semaphore
-    notifyResultByKey[key] = false
+    let timeoutMs = max(1000, min(30000, op.timeoutMs))
+    var started = false
+    switch op.opName {
+    case "discoverServices":
+      pendingDiscoverRequestByDeviceId[op.deviceId] = op.requestId
+      peripheral.discoverServices(nil)
+      started = true
+    case "readCharacteristic":
+      guard let address = op.address,
+            let characteristic = findCharacteristic(peripheral: peripheral, address: address)
+      else {
+        stateLock.unlock()
+        return false
+      }
+      pendingReadRequestByKey[characteristicKey(address)] = op.requestId
+      peripheral.readValue(for: characteristic)
+      started = true
+    case "writeCharacteristic":
+      guard let address = op.address,
+            let characteristic = findCharacteristic(peripheral: peripheral, address: address)
+      else {
+        stateLock.unlock()
+        return false
+      }
+      pendingWriteRequestByKey[characteristicKey(address)] = op.requestId
+      peripheral.writeValue(Data(op.value ?? []), for: characteristic, type: .withResponse)
+      started = true
+    case "setCharacteristicNotification":
+      guard let address = op.address,
+            let characteristic = findCharacteristic(peripheral: peripheral, address: address)
+      else {
+        stateLock.unlock()
+        return false
+      }
+      pendingNotifyRequestByKey[characteristicKey(address)] = op.requestId
+      peripheral.setNotifyValue(op.enable == true, for: characteristic)
+      started = true
+    default:
+      started = false
+    }
+    if !started {
+      stateLock.unlock()
+      return false
+    }
+    let pending = PendingGattRequest(
+      requestId: op.requestId,
+      opName: op.opName,
+      deviceId: op.deviceId,
+      addressKey: op.address.map(characteristicKey)
+    )
+    pendingGattByRequestId[op.requestId] = pending
+    let timeoutWork = DispatchWorkItem { [weak self] in
+      self?.stateLock.lock()
+      defer { self?.stateLock.unlock() }
+      self?.completePendingRequest(
+        requestId: op.requestId,
+        success: false,
+        errorCode: "BLE_GATT_OPERATION_TIMEOUT",
+        errorMessage: "\(op.opName) timed out for \(op.deviceId)",
+        payload: nil
+      )
+    }
+    pendingTimeoutByRequestId[op.requestId] = timeoutWork
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(timeoutMs)), execute: timeoutWork)
     stateLock.unlock()
-    peripheral.setNotifyValue(enable, for: characteristic)
-    let waitResult = semaphore.wait(timeout: .now() + .seconds(8))
-    stateLock.lock()
-    notifySemaphoreByKey[key] = nil
-    let result = notifyResultByKey.removeValue(forKey: key) ?? false
-    stateLock.unlock()
-    if waitResult == .timedOut { return false }
-    return result
+    return true
   }
 
   func getSnapshot() -> String {
@@ -456,8 +459,6 @@ class NitroBleScan: HybridNitroBleScanSpec {
     peripheral.delegate = peripheralDelegate
     connectedPeripherals[id] = peripheral
     connectionStateById[id] = "connected"
-    connectResultById[id] = true
-    connectSemaphoreById[id]?.signal()
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "connected"])
   }
 
@@ -465,10 +466,13 @@ class NitroBleScan: HybridNitroBleScanSpec {
     stateLock.lock()
     defer { stateLock.unlock() }
     let id = peripheral.identifier.uuidString
+    failPendingRequestsForDevice(
+      deviceId: id,
+      errorCode: "BLE_CONNECT_FAILED",
+      errorMessage: "Connection failed while operation pending."
+    )
     clearDeviceState(deviceId: id)
     connectionStateById[id] = "disconnected"
-    connectResultById[id] = false
-    connectSemaphoreById[id]?.signal()
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "disconnected"])
     emitIssue(
       type: "warning",
@@ -483,6 +487,11 @@ class NitroBleScan: HybridNitroBleScanSpec {
     stateLock.lock()
     defer { stateLock.unlock() }
     let id = peripheral.identifier.uuidString
+    failPendingRequestsForDevice(
+      deviceId: id,
+      errorCode: "BLE_DEVICE_DISCONNECTED",
+      errorMessage: "Device disconnected while operation pending."
+    )
     clearDeviceState(deviceId: id)
     connectionStateById[id] = "disconnected"
     emitEvent(type: "connectionStateChanged", payload: ["deviceId": id, "state": "disconnected"])
@@ -518,22 +527,67 @@ class NitroBleScan: HybridNitroBleScanSpec {
     serviceCache.removeValue(forKey: deviceId)
     discoveredPeripherals.removeValue(forKey: deviceId)
     discoverOrder.removeAll { $0 == deviceId }
-    connectResultById.removeValue(forKey: deviceId)
-    connectSemaphoreById.removeValue(forKey: deviceId)
-    discoverSemaphoreById.removeValue(forKey: deviceId)
-    discoverResultById.removeValue(forKey: deviceId)
+    pendingDiscoverRequestByDeviceId.removeValue(forKey: deviceId)
     let prefix = "\(deviceId)|"
-    readSemaphoreByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
-      readSemaphoreByKey.removeValue(forKey: key)
-      readResultByKey.removeValue(forKey: key)
+    pendingReadRequestByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
+      pendingReadRequestByKey.removeValue(forKey: key)
     }
-    writeSemaphoreByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
-      writeSemaphoreByKey.removeValue(forKey: key)
-      writeResultByKey.removeValue(forKey: key)
+    pendingWriteRequestByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
+      pendingWriteRequestByKey.removeValue(forKey: key)
     }
-    notifySemaphoreByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
-      notifySemaphoreByKey.removeValue(forKey: key)
-      notifyResultByKey.removeValue(forKey: key)
+    pendingNotifyRequestByKey.keys.filter { $0.hasPrefix(prefix) }.forEach { key in
+      pendingNotifyRequestByKey.removeValue(forKey: key)
+    }
+  }
+
+  private func clearPendingLookup(requestId: String, deviceId: String, addressKey: String?) {
+    if pendingDiscoverRequestByDeviceId[deviceId] == requestId {
+      pendingDiscoverRequestByDeviceId.removeValue(forKey: deviceId)
+    }
+    if let addressKey {
+      if pendingReadRequestByKey[addressKey] == requestId {
+        pendingReadRequestByKey.removeValue(forKey: addressKey)
+      }
+      if pendingWriteRequestByKey[addressKey] == requestId {
+        pendingWriteRequestByKey.removeValue(forKey: addressKey)
+      }
+      if pendingNotifyRequestByKey[addressKey] == requestId {
+        pendingNotifyRequestByKey.removeValue(forKey: addressKey)
+      }
+    }
+  }
+
+  private func completePendingRequest(
+    requestId: String,
+    success: Bool,
+    errorCode: String?,
+    errorMessage: String?,
+    payload: [String: Any]?
+  ) {
+    guard let pending = pendingGattByRequestId.removeValue(forKey: requestId) else { return }
+    pendingTimeoutByRequestId.removeValue(forKey: requestId)?.cancel()
+    clearPendingLookup(requestId: requestId, deviceId: pending.deviceId, addressKey: pending.addressKey)
+    emitGattOperationResult(
+      requestId: requestId,
+      opName: pending.opName,
+      deviceId: pending.deviceId,
+      success: success,
+      errorCode: errorCode,
+      errorMessage: errorMessage,
+      payload: payload
+    )
+  }
+
+  private func failPendingRequestsForDevice(deviceId: String, errorCode: String, errorMessage: String) {
+    let requestIds = pendingGattByRequestId.values.filter { $0.deviceId == deviceId }.map(\.requestId)
+    requestIds.forEach { requestId in
+      completePendingRequest(
+        requestId: requestId,
+        success: false,
+        errorCode: errorCode,
+        errorMessage: errorMessage,
+        payload: nil
+      )
     }
   }
 
@@ -591,6 +645,35 @@ class NitroBleScan: HybridNitroBleScanSpec {
           let characteristicUuid = root["characteristicUuid"] as? String
     else { return nil }
     return CharacteristicAddress(deviceId: deviceId, serviceUuid: serviceUuid, characteristicUuid: characteristicUuid)
+  }
+
+  private func parseGattOperation(_ json: String) -> GattOperationRequest? {
+    guard let data = json.data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let requestId = root["requestId"] as? String,
+          let opName = root["opName"] as? String,
+          let deviceId = root["deviceId"] as? String
+    else { return nil }
+    let address: CharacteristicAddress?
+    if let addr = root["address"] as? [String: Any],
+       let addrData = try? JSONSerialization.data(withJSONObject: addr),
+       let addrJson = String(data: addrData, encoding: .utf8) {
+      address = parseAddress(addrJson)
+    } else {
+      address = nil
+    }
+    let value = (root["value"] as? [NSNumber])?.map { UInt8(clamping: $0.intValue) }
+    let enable = root["enable"] as? Bool
+    let timeoutMs = (root["timeoutMs"] as? NSNumber)?.int64Value ?? 12000
+    return GattOperationRequest(
+      requestId: requestId,
+      opName: opName,
+      deviceId: deviceId,
+      address: address,
+      value: value,
+      enable: enable,
+      timeoutMs: timeoutMs
+    )
   }
 
   private func characteristicKey(_ address: CharacteristicAddress) -> String {
@@ -652,6 +735,31 @@ class NitroBleScan: HybridNitroBleScanSpec {
     emitRawEvent(["type": type, "ts": nowMs(), "payload": payload])
   }
 
+  private func emitGattOperationResult(
+    requestId: String,
+    opName: String,
+    deviceId: String,
+    success: Bool,
+    errorCode: String?,
+    errorMessage: String?,
+    payload: [String: Any]?
+  ) {
+    var body: [String: Any] = [
+      "requestId": requestId,
+      "opName": opName,
+      "deviceId": deviceId,
+      "success": success,
+    ]
+    if let payload {
+      payload.forEach { body[$0.key] = $0.value }
+    }
+    if !success {
+      if let errorCode { body["errorCode"] = errorCode }
+      if let errorMessage { body["errorMessage"] = errorMessage }
+    }
+    emitEvent(type: "gattOperationResult", payload: body)
+  }
+
   func handlePeripheralDidDiscoverServices(peripheral: CBPeripheral, error: Error?) {
     stateLock.lock()
     defer { stateLock.unlock() }
@@ -669,11 +777,16 @@ class NitroBleScan: HybridNitroBleScanSpec {
     if let data = try? JSONSerialization.data(withJSONObject: jsonServices),
        let json = String(data: data, encoding: .utf8) {
       serviceCache[deviceId] = json
-      discoverResultById[deviceId] = json
-    } else {
-      discoverResultById[deviceId] = "[]"
     }
-    discoverSemaphoreById[deviceId]?.signal()
+    if let requestId = pendingDiscoverRequestByDeviceId[deviceId] {
+      completePendingRequest(
+        requestId: requestId,
+        success: true,
+        errorCode: nil,
+        errorMessage: nil,
+        payload: ["services": jsonServices]
+      )
+    }
   }
 
   func handlePeripheralDidUpdateValue(
@@ -687,8 +800,15 @@ class NitroBleScan: HybridNitroBleScanSpec {
     let serviceUuid = characteristic.service?.uuid.uuidString ?? ""
     let key = "\(deviceId)|\(serviceUuid)|\(characteristic.uuid.uuidString)"
     let value = (characteristic.value ?? Data()).map { Int($0) }
-    readResultByKey[key] = value
-    readSemaphoreByKey[key]?.signal()
+    if let requestId = pendingReadRequestByKey[key] {
+      completePendingRequest(
+        requestId: requestId,
+        success: error == nil,
+        errorCode: error == nil ? nil : "BLE_READ_CHARACTERISTIC_FAILED",
+        errorMessage: error?.localizedDescription,
+        payload: error == nil ? ["value": value] : nil
+      )
+    }
     emitEvent(
       type: "characteristicValueChanged",
       payload: [
@@ -709,8 +829,15 @@ class NitroBleScan: HybridNitroBleScanSpec {
     defer { stateLock.unlock() }
     let serviceUuid = characteristic.service?.uuid.uuidString ?? ""
     let key = "\(peripheral.identifier.uuidString)|\(serviceUuid)|\(characteristic.uuid.uuidString)"
-    writeResultByKey[key] = (error == nil)
-    writeSemaphoreByKey[key]?.signal()
+    if let requestId = pendingWriteRequestByKey[key] {
+      completePendingRequest(
+        requestId: requestId,
+        success: error == nil,
+        errorCode: error == nil ? nil : "BLE_WRITE_CHARACTERISTIC_FAILED",
+        errorMessage: error?.localizedDescription,
+        payload: nil
+      )
+    }
   }
 
   func handlePeripheralDidUpdateNotificationState(
@@ -722,8 +849,15 @@ class NitroBleScan: HybridNitroBleScanSpec {
     defer { stateLock.unlock() }
     let serviceUuid = characteristic.service?.uuid.uuidString ?? ""
     let key = "\(peripheral.identifier.uuidString)|\(serviceUuid)|\(characteristic.uuid.uuidString)"
-    notifyResultByKey[key] = (error == nil)
-    notifySemaphoreByKey[key]?.signal()
+    if let requestId = pendingNotifyRequestByKey[key] {
+      completePendingRequest(
+        requestId: requestId,
+        success: error == nil,
+        errorCode: error == nil ? nil : "BLE_SET_NOTIFICATION_FAILED",
+        errorMessage: error?.localizedDescription,
+        payload: nil
+      )
+    }
   }
 
   private func emitRawEvent(_ event: [String: Any]) {
@@ -737,6 +871,43 @@ class NitroBleScan: HybridNitroBleScanSpec {
     } catch {
       eventsDropped += 1
     }
+  }
+
+  func dispose() {
+    stateLock.lock()
+    cleanupResourcesLocked()
+    stateLock.unlock()
+  }
+
+  private func cleanupResourcesLocked() {
+    if isDisposed { return }
+    isDisposed = true
+    if isScanning {
+      centralManager.stopScan()
+      isScanning = false
+    }
+    pendingGattByRequestId.keys.forEach { requestId in
+      completePendingRequest(
+        requestId: requestId,
+        success: false,
+        errorCode: "BLE_MODULE_DISPOSED",
+        errorMessage: "Module disposed while operation pending.",
+        payload: nil
+      )
+    }
+    connectedPeripherals.values.forEach { peripheral in
+      centralManager.cancelPeripheralConnection(peripheral)
+    }
+    connectedPeripherals.removeAll()
+    discoveredPeripherals.removeAll()
+    serviceCache.removeAll()
+    pendingTimeoutByRequestId.values.forEach { $0.cancel() }
+    pendingTimeoutByRequestId.removeAll()
+    pendingDiscoverRequestByDeviceId.removeAll()
+    pendingReadRequestByKey.removeAll()
+    pendingWriteRequestByKey.removeAll()
+    pendingNotifyRequestByKey.removeAll()
+    eventListener = nil
   }
 
   private func stringify(_ payload: [String: Any]) -> String {

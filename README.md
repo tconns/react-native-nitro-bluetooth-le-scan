@@ -26,6 +26,8 @@ Most BLE integrations break at scale because they focus only on happy-path scann
 - connect/discover/read/write sequencing risks,
 - production incident debugging with insufficient telemetry.
 
+New in `0.7.x`: GATT `discover/read/write/notify` now use a fully event-driven native pipeline (no native blocking wait), while keeping Promise-based JS APIs for app ergonomics.
+
 ## Feature Matrix By Phase
 
 | Phase | Focus | What You Get |
@@ -253,6 +255,23 @@ const value = await readBleCharacteristic({
 })
 ```
 
+### Path B.1: Event-Driven Operation Result (advanced)
+
+All GATT operations are internally request-scoped (`requestId`) and resolved from native `gattOperationResult` events.
+You can observe these events for deep diagnostics:
+
+```ts
+const unsubscribe = subscribeBleScan((event) => {
+  if (event.type === 'gattOperationResult') {
+    console.log(
+      event.payload.requestId,
+      event.payload.opName,
+      event.payload.success
+    )
+  }
+})
+```
+
 ### Path C: Production-Safe Flow
 
 Use this in production apps where race safety and telemetry matter.
@@ -326,10 +345,11 @@ function BleScreen() {
 
 - `connectBleDevice(deviceId, options?)`
 - `disconnectBleDevice(deviceId)`
-- `discoverBleServices(deviceId)`
-- `readBleCharacteristic(address)`
-- `writeBleCharacteristic(address, value)`
-- `setBleCharacteristicNotification(address, enable)`
+- `discoverBleServices(deviceId, options?)`
+- `readBleCharacteristic(address, options?)`
+- `writeBleCharacteristic(address, value, options?)`
+- `setBleCharacteristicNotification(address, enable, options?)`
+- `disposeBleRuntime()`
 
 ### Harden Runtime Behavior
 
@@ -357,8 +377,22 @@ Main events:
 - `connectionStateChanged`
 - `servicesDiscovered`
 - `characteristicValueChanged`
+- `gattOperationResult`
 - `warning`
 - `error`
+
+`gattOperationResult` payload shape:
+
+- `requestId`
+- `opName` (`discoverServices`, `readCharacteristic`, `writeCharacteristic`, `setCharacteristicNotification`)
+- `deviceId`
+- `success`
+- optional success payload:
+  - `services` (for `discoverServices`)
+  - `value` (for `readCharacteristic`)
+- optional failure payload:
+  - `errorCode`
+  - `errorMessage`
 
 Error payload shape:
 
@@ -386,7 +420,12 @@ Lifecycle hardening rules:
 - always keep and call unsubscribe function from `subscribeBleScan(...)` on screen unmount
 - always disconnect active devices before leaving a screen with GATT actions
 - always turn off notifications when no longer needed
+- call `disposeBleRuntime()` when tearing down the module runtime in integration tests or app shutdown flows
 - collect `report + trace` in QA bug reports for connection/perf incidents
+
+Native lifecycle note:
+
+- This module now uses proactive native cleanup via `dispose()` (called by `disposeBleRuntime()`), instead of relying on `finalize` timing.
 
 ## DX Commands
 
@@ -493,6 +532,17 @@ Fix now:
 
 - run GATT operations through `createGattOperationQueue()`
 - inspect `pendingOperationCount` in snapshot and include it in diagnostics
+
+### Symptom: GATT Promise never resolves after app teardown/navigation reset
+
+Likely cause:
+
+- runtime disposed while requests are still in-flight
+
+Fix now:
+
+- call `disposeBleRuntime()` only during intentional teardown
+- re-create subscriptions and restart flow after app/screen re-init
 
 ### Symptom: iOS build integration issues
 

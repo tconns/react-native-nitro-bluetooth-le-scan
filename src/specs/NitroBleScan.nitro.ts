@@ -9,10 +9,7 @@ export interface NitroBleScan
   stopScan(): boolean
   connect(deviceId: string, optionsJson: string): boolean
   disconnect(deviceId: string): boolean
-  discoverServices(deviceId: string): string
-  readCharacteristic(addressJson: string): string
-  writeCharacteristic(addressJson: string, valueJson: string): boolean
-  setCharacteristicNotification(addressJson: string, enable: boolean): boolean
+  submitGattOperation(operationJson: string): boolean
   getSnapshot(): string
   setEventListener(listener: (eventJson: string) => void): void
 }

@@ -71,6 +71,16 @@ export type BleScanError = {
   platformDetails?: string
 }
 
+export type BleGattOperationName =
+  | 'discoverServices'
+  | 'readCharacteristic'
+  | 'writeCharacteristic'
+  | 'setCharacteristicNotification'
+
+export type BleGattOperationOptions = {
+  timeoutMs?: number
+}
+
 export type BleScanEvent =
   | { type: 'scanStarted'; ts: number }
   | { type: 'scanStopped'; ts: number; reason?: string }
@@ -86,6 +96,11 @@ export type BleScanEvent =
       type: 'characteristicValueChanged'
       ts: number
       payload: BleGattCharacteristicAddress & { value: number[] }
+    }
+  | {
+      type: 'gattOperationResult'
+      ts: number
+      payload: BleGattOperationResult
     }
   | { type: 'warning' | 'error'; ts: number; payload: BleScanError }
 
@@ -114,15 +129,23 @@ export type BleScanManager = {
   stopScan: () => Promise<boolean>
   connect: (deviceId: string, options?: BleConnectionOptions) => Promise<boolean>
   disconnect: (deviceId: string) => Promise<boolean>
-  discoverServices: (deviceId: string) => Promise<BleGattService[]>
-  readCharacteristic: (address: BleGattCharacteristicAddress) => Promise<number[]>
+  discoverServices: (
+    deviceId: string,
+    options?: BleGattOperationOptions
+  ) => Promise<BleGattService[]>
+  readCharacteristic: (
+    address: BleGattCharacteristicAddress,
+    options?: BleGattOperationOptions
+  ) => Promise<number[]>
   writeCharacteristic: (
     address: BleGattCharacteristicAddress,
-    value: number[]
+    value: number[],
+    options?: BleGattOperationOptions
   ) => Promise<boolean>
   setCharacteristicNotification: (
     address: BleGattCharacteristicAddress,
-    enable: boolean
+    enable: boolean,
+    options?: BleGattOperationOptions
   ) => Promise<boolean>
   getSnapshot: () => BleScanSnapshot
   subscribe: (listener: (event: BleScanEvent) => void) => () => void
@@ -162,6 +185,65 @@ export type BleGattService = {
   uuid: string
   characteristicUuids: string[]
 }
+
+export type BleGattOperationRequest =
+  | {
+      requestId: string
+      opName: 'discoverServices'
+      deviceId: string
+      timeoutMs?: number
+    }
+  | {
+      requestId: string
+      opName: 'readCharacteristic'
+      deviceId: string
+      address: BleGattCharacteristicAddress
+      timeoutMs?: number
+    }
+  | {
+      requestId: string
+      opName: 'writeCharacteristic'
+      deviceId: string
+      address: BleGattCharacteristicAddress
+      value: number[]
+      timeoutMs?: number
+    }
+  | {
+      requestId: string
+      opName: 'setCharacteristicNotification'
+      deviceId: string
+      address: BleGattCharacteristicAddress
+      enable: boolean
+      timeoutMs?: number
+    }
+
+export type BleGattOperationResult =
+  | {
+      requestId: string
+      opName: 'discoverServices'
+      deviceId: string
+      success: boolean
+      services?: BleGattService[]
+      errorCode?: string
+      errorMessage?: string
+    }
+  | {
+      requestId: string
+      opName: 'readCharacteristic'
+      deviceId: string
+      success: boolean
+      value?: number[]
+      errorCode?: string
+      errorMessage?: string
+    }
+  | {
+      requestId: string
+      opName: 'writeCharacteristic' | 'setCharacteristicNotification'
+      deviceId: string
+      success: boolean
+      errorCode?: string
+      errorMessage?: string
+    }
 
 export type BleConnectionAdapter = {
   connect: (deviceId: string) => Promise<void>

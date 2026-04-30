@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
@@ -26,9 +27,9 @@ import com.margelo.nitro.NitroModules
 import kotlin.math.roundToInt
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
@@ -55,15 +56,13 @@ class NitroBleScan : HybridNitroBleScanSpec() {
   private val gattByDeviceId = ConcurrentHashMap<String, BluetoothGatt>()
   private val connectionStateByDeviceId = ConcurrentHashMap<String, String>()
   private val serviceCacheByDeviceId = ConcurrentHashMap<String, String>()
-  private val connectLatchByDeviceId = ConcurrentHashMap<String, CountDownLatch>()
-  private val discoverLatchByDeviceId = ConcurrentHashMap<String, CountDownLatch>()
-  private val readLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
-  private val readValueByKey = ConcurrentHashMap<String, List<Int>>()
-  private val writeLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
-  private val writeResultByKey = ConcurrentHashMap<String, Boolean>()
-  private val notifyLatchByKey = ConcurrentHashMap<String, CountDownLatch>()
-  private val notifyResultByKey = ConcurrentHashMap<String, Boolean>()
   private val connectTokenByDeviceId = ConcurrentHashMap<String, Long>()
+  private val pendingGattByRequestId = ConcurrentHashMap<String, PendingGattRequest>()
+  private val pendingGattTimeoutByRequestId = ConcurrentHashMap<String, ScheduledFuture<*>>()
+  private val pendingDiscoverRequestByDeviceId = ConcurrentHashMap<String, String>()
+  private val pendingReadRequestByKey = ConcurrentHashMap<String, String>()
+  private val pendingWriteRequestByKey = ConcurrentHashMap<String, String>()
+  private val pendingNotifyRequestByKey = ConcurrentHashMap<String, String>()
   private val operationScheduler = Executors.newSingleThreadScheduledExecutor()
   private val isShuttingDown = AtomicBoolean(false)
   private var deviceEventCounter = 0
@@ -142,6 +141,13 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     val recency: Double = 0.25,
     val connectable: Double = 0.1,
     val transport: Double = 0.05
+  )
+
+  private data class PendingGattRequest(
+    val requestId: String,
+    val opName: String,
+    val deviceId: String,
+    val addressKey: String?
   )
 
   override fun getAdapterState(): String {
@@ -338,102 +344,101 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     }
   }
 
-  override fun discoverServices(deviceId: String): String {
-    serviceCacheByDeviceId[deviceId]?.let { return it }
-    val gatt = gattByDeviceId[deviceId] ?: return "[]"
-    return try {
-      val latch = CountDownLatch(1)
-      discoverLatchByDeviceId[deviceId] = latch
-      val started = gatt.discoverServices()
+  override fun submitGattOperation(operationJson: String): Boolean {
+    val op = parseGattOperation(operationJson) ?: return false
+    val gatt = gattByDeviceId[op.deviceId] ?: return false
+    val timeoutMs = op.timeoutMs.coerceIn(1000L, 30000L)
+    synchronized(stateLock) {
+      if (pendingGattByRequestId.containsKey(op.requestId)) return false
+      val started =
+        when (op.opName) {
+          "discoverServices" -> {
+            pendingDiscoverRequestByDeviceId[op.deviceId] = op.requestId
+            gatt.discoverServices()
+          }
+          "readCharacteristic" -> {
+            val address = op.address ?: return false
+            val characteristic = findCharacteristic(gatt, address) ?: return false
+            val key = characteristicKey(address)
+            pendingReadRequestByKey[key] = op.requestId
+            gatt.readCharacteristic(characteristic)
+          }
+          "writeCharacteristic" -> {
+            val address = op.address ?: return false
+            val characteristic = findCharacteristic(gatt, address) ?: return false
+            val value = op.value ?: emptyList()
+            val key = characteristicKey(address)
+            pendingWriteRequestByKey[key] = op.requestId
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+              gatt.writeCharacteristic(
+                characteristic,
+                intListToByteArray(value),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+              ) == BluetoothStatusCodes.SUCCESS
+            } else {
+              characteristic.value = intListToByteArray(value)
+              gatt.writeCharacteristic(characteristic)
+            }
+          }
+          "setCharacteristicNotification" -> {
+            val address = op.address ?: return false
+            val characteristic = findCharacteristic(gatt, address) ?: return false
+            val key = characteristicKey(address)
+            if (!gatt.setCharacteristicNotification(characteristic, op.enable == true)) {
+              false
+            } else {
+              val ccc = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+              if (ccc == null) {
+                emitGattOperationResult(op.requestId, op.opName, op.deviceId, true, null, null)
+                return true
+              }
+              ccc.value =
+                if (op.enable == true) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+              pendingNotifyRequestByKey[key] = op.requestId
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(ccc, ccc.value) == BluetoothStatusCodes.SUCCESS
+              } else {
+                gatt.writeDescriptor(ccc)
+              }
+            }
+          }
+          else -> false
+        }
       if (!started) {
-        discoverLatchByDeviceId.remove(deviceId)
-        return "[]"
+        clearPendingRequestLookup(op.requestId, op.deviceId, op.address?.let { characteristicKey(it) })
+        return false
       }
-      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
-      discoverLatchByDeviceId.remove(deviceId)
-      if (!ok) return "[]"
-      serviceCacheByDeviceId[deviceId] ?: "[]"
-    } catch (_: Throwable) {
-      "[]"
-    }
-  }
-
-  override fun readCharacteristic(addressJson: String): String {
-    val address = parseAddress(addressJson) ?: return "[]"
-    val gatt = gattByDeviceId[address.deviceId] ?: return "[]"
-    val characteristic = findCharacteristic(gatt, address) ?: return "[]"
-    val key = characteristicKey(address)
-    return try {
-      val latch = CountDownLatch(1)
-      readLatchByKey[key] = latch
-      val started = gatt.readCharacteristic(characteristic)
-      if (!started) {
-        readLatchByKey.remove(key)
-        return "[]"
-      }
-      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
-      readLatchByKey.remove(key)
-      if (!ok) return "[]"
-      JSONArray(readValueByKey.remove(key) ?: emptyList<Int>()).toString()
-    } catch (_: Throwable) {
-      "[]"
-    }
-  }
-
-  override fun writeCharacteristic(addressJson: String, valueJson: String): Boolean {
-    val address = parseAddress(addressJson) ?: return false
-    val gatt = gattByDeviceId[address.deviceId] ?: return false
-    val characteristic = findCharacteristic(gatt, address) ?: return false
-    val value = parseByteArray(valueJson)
-    val key = characteristicKey(address)
-    return try {
-      val latch = CountDownLatch(1)
-      writeLatchByKey[key] = latch
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        gatt.writeCharacteristic(
-          characteristic,
-          intListToByteArray(value),
-          BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+      pendingGattByRequestId[op.requestId] =
+        PendingGattRequest(
+          requestId = op.requestId,
+          opName = op.opName,
+          deviceId = op.deviceId,
+          addressKey = op.address?.let { characteristicKey(it) }
         )
-      } else {
-        characteristic.value = intListToByteArray(value)
-        gatt.writeCharacteristic(characteristic)
+      try {
+        pendingGattTimeoutByRequestId[op.requestId] = operationScheduler.schedule({
+          synchronized(stateLock) {
+            completePendingRequest(
+              op.requestId,
+              success = false,
+              errorCode = "BLE_GATT_OPERATION_TIMEOUT",
+              errorMessage = "${op.opName} timed out for ${op.deviceId}",
+              payload = null
+            )
+          }
+        }, timeoutMs, TimeUnit.MILLISECONDS)
+      } catch (_: RejectedExecutionException) {
+        completePendingRequest(
+          op.requestId,
+          success = false,
+          errorCode = "BLE_GATT_SCHEDULER_REJECTED",
+          errorMessage = "Operation scheduler rejected ${op.opName}",
+          payload = null
+        )
+        return false
       }
-      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
-      writeLatchByKey.remove(key)
-      if (!ok) return false
-      writeResultByKey.remove(key) ?: false
-    } catch (_: Throwable) {
-      false
-    }
-  }
-
-  override fun setCharacteristicNotification(addressJson: String, enable: Boolean): Boolean {
-    val address = parseAddress(addressJson) ?: return false
-    val gatt = gattByDeviceId[address.deviceId] ?: return false
-    val characteristic = findCharacteristic(gatt, address) ?: return false
-    val key = characteristicKey(address)
-    return try {
-      if (!gatt.setCharacteristicNotification(characteristic, enable)) return false
-      val ccc =
-        characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-          ?: return true
-      ccc.value =
-        if (enable) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-      val latch = CountDownLatch(1)
-      notifyLatchByKey[key] = latch
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        gatt.writeDescriptor(ccc, ccc.value)
-      } else {
-        gatt.writeDescriptor(ccc)
-      }
-      val ok = latch.await(8000L, TimeUnit.MILLISECONDS)
-      notifyLatchByKey.remove(key)
-      if (!ok) return false
-      notifyResultByKey.remove(key) ?: false
-    } catch (_: Throwable) {
-      false
+      return true
     }
   }
 
@@ -468,15 +473,14 @@ class NitroBleScan : HybridNitroBleScanSpec() {
           connectTokenByDeviceId.remove(deviceId)
           connectionStateByDeviceId[deviceId] = "connected"
           emitConnectionState(deviceId, "connected")
-          connectLatchByDeviceId.remove(deviceId)?.countDown()
           return
         }
         connectTokenByDeviceId.remove(deviceId)
         connectionStateByDeviceId[deviceId] = "disconnected"
         emitConnectionState(deviceId, "disconnected")
+        failPendingRequestsForDevice(deviceId, "BLE_DEVICE_DISCONNECTED", "Device disconnected during pending GATT operation.")
         closeGattForDevice(deviceId)
         clearDeviceState(deviceId)
-        connectLatchByDeviceId.remove(deviceId)?.countDown()
       }
     }
 
@@ -504,8 +508,22 @@ class NitroBleScan : HybridNitroBleScanSpec() {
               put("services", services)
             }
           )
+          val requestId = pendingDiscoverRequestByDeviceId[deviceId]
+          if (requestId != null) {
+            completePendingRequest(requestId, true, null, null, services)
+          }
+        } else {
+          val requestId = pendingDiscoverRequestByDeviceId[deviceId]
+          if (requestId != null) {
+            completePendingRequest(
+              requestId,
+              false,
+              "BLE_DISCOVER_SERVICES_FAILED",
+              "discoverServices failed with status=$status",
+              null
+            )
+          }
         }
-        discoverLatchByDeviceId.remove(deviceId)?.countDown()
       }
     }
 
@@ -519,9 +537,28 @@ class NitroBleScan : HybridNitroBleScanSpec() {
         val deviceId = gatt.device?.address ?: return
         val key = "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
         if (status == BluetoothGatt.GATT_SUCCESS) {
-          readValueByKey[key] = value.map { byte: Byte -> byte.toInt() and 0xFF }
+          val requestId = pendingReadRequestByKey[key]
+          if (requestId != null) {
+            completePendingRequest(
+              requestId,
+              true,
+              null,
+              null,
+              JSONArray(value.map { byte: Byte -> byte.toInt() and 0xFF })
+            )
+          }
+        } else {
+          val requestId = pendingReadRequestByKey[key]
+          if (requestId != null) {
+            completePendingRequest(
+              requestId,
+              false,
+              "BLE_READ_CHARACTERISTIC_FAILED",
+              "readCharacteristic failed with status=$status",
+              null
+            )
+          }
         }
-        readLatchByKey.remove(key)?.countDown()
       }
     }
 
@@ -534,9 +571,28 @@ class NitroBleScan : HybridNitroBleScanSpec() {
         val deviceId = gatt.device?.address ?: return
         val key = "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
         if (status == BluetoothGatt.GATT_SUCCESS) {
-          readValueByKey[key] = (characteristic.value ?: byteArrayOf()).map { byte: Byte -> byte.toInt() and 0xFF }
+          val requestId = pendingReadRequestByKey[key]
+          if (requestId != null) {
+            completePendingRequest(
+              requestId,
+              true,
+              null,
+              null,
+              JSONArray((characteristic.value ?: byteArrayOf()).map { byte: Byte -> byte.toInt() and 0xFF })
+            )
+          }
+        } else {
+          val requestId = pendingReadRequestByKey[key]
+          if (requestId != null) {
+            completePendingRequest(
+              requestId,
+              false,
+              "BLE_READ_CHARACTERISTIC_FAILED",
+              "readCharacteristic failed with status=$status",
+              null
+            )
+          }
         }
-        readLatchByKey.remove(key)?.countDown()
       }
     }
 
@@ -548,8 +604,16 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       synchronized(stateLock) {
         val deviceId = gatt.device?.address ?: return
         val key = "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
-        writeResultByKey[key] = status == BluetoothGatt.GATT_SUCCESS
-        writeLatchByKey.remove(key)?.countDown()
+        val requestId = pendingWriteRequestByKey[key]
+        if (requestId != null) {
+          completePendingRequest(
+            requestId,
+            status == BluetoothGatt.GATT_SUCCESS,
+            if (status == BluetoothGatt.GATT_SUCCESS) null else "BLE_WRITE_CHARACTERISTIC_FAILED",
+            if (status == BluetoothGatt.GATT_SUCCESS) null else "writeCharacteristic failed with status=$status",
+            null
+          )
+        }
       }
     }
 
@@ -561,8 +625,16 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       synchronized(stateLock) {
         val deviceId = gatt.device?.address ?: return
         val key = "$deviceId|${descriptor.characteristic.service.uuid}|${descriptor.characteristic.uuid}"
-        notifyResultByKey[key] = status == BluetoothGatt.GATT_SUCCESS
-        notifyLatchByKey.remove(key)?.countDown()
+        val requestId = pendingNotifyRequestByKey[key]
+        if (requestId != null) {
+          completePendingRequest(
+            requestId,
+            status == BluetoothGatt.GATT_SUCCESS,
+            if (status == BluetoothGatt.GATT_SUCCESS) null else "BLE_SET_NOTIFICATION_FAILED",
+            if (status == BluetoothGatt.GATT_SUCCESS) null else "setCharacteristicNotification failed with status=$status",
+            null
+          )
+        }
       }
     }
 
@@ -808,6 +880,32 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     )
   }
 
+  private fun emitGattOperationResult(
+    requestId: String,
+    opName: String,
+    deviceId: String,
+    success: Boolean,
+    errorCode: String?,
+    errorMessage: String?,
+    payload: Any? = null
+  ) {
+    val body = JSONObject().apply {
+      put("requestId", requestId)
+      put("opName", opName)
+      put("deviceId", deviceId)
+      put("success", success)
+      when {
+        opName == "discoverServices" && payload is JSONArray -> put("services", payload)
+        opName == "readCharacteristic" && payload is JSONArray -> put("value", payload)
+      }
+      if (!success) {
+        if (errorCode != null) put("errorCode", errorCode)
+        if (errorMessage != null) put("errorMessage", errorMessage)
+      }
+    }
+    emitEvent("gattOperationResult", body)
+  }
+
   private fun emitRawEvent(event: JSONObject) {
     listener?.let {
       try {
@@ -826,6 +924,38 @@ class NitroBleScan : HybridNitroBleScanSpec() {
     val serviceUuid: String,
     val characteristicUuid: String
   )
+
+  private data class GattOperationRequest(
+    val requestId: String,
+    val opName: String,
+    val deviceId: String,
+    val address: CharacteristicAddress?,
+    val value: List<Int>?,
+    val enable: Boolean?,
+    val timeoutMs: Long
+  )
+
+  private fun parseGattOperation(json: String): GattOperationRequest? {
+    return try {
+      val root = JSONObject(json)
+      val opName = root.optString("opName")
+      val requestId = root.optString("requestId")
+      val deviceId = root.optString("deviceId")
+      if (opName.isBlank() || requestId.isBlank() || deviceId.isBlank()) return null
+      val addressJson = root.optJSONObject("address")?.toString()
+      GattOperationRequest(
+        requestId = requestId,
+        opName = opName,
+        deviceId = deviceId,
+        address = addressJson?.let(::parseAddress),
+        value = root.optJSONArray("value")?.toString()?.let(::parseByteArray),
+        enable = if (root.has("enable")) root.optBoolean("enable") else null,
+        timeoutMs = root.optLong("timeoutMs", 12000L)
+      )
+    } catch (_: Throwable) {
+      null
+    }
+  }
 
   private fun parseAddress(json: String): CharacteristicAddress? {
     return try {
@@ -881,26 +1011,61 @@ class NitroBleScan : HybridNitroBleScanSpec() {
 
   private fun clearOperationStateForDevice(deviceId: String) {
     val prefix = "$deviceId|"
-    readLatchByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
-      readLatchByKey.remove(key)
-      readValueByKey.remove(key)
+    pendingReadRequestByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
+      pendingReadRequestByKey.remove(key)
     }
-    writeLatchByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
-      writeLatchByKey.remove(key)
-      writeResultByKey.remove(key)
+    pendingWriteRequestByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
+      pendingWriteRequestByKey.remove(key)
     }
-    notifyLatchByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
-      notifyLatchByKey.remove(key)
-      notifyResultByKey.remove(key)
+    pendingNotifyRequestByKey.keys.filter { it.startsWith(prefix) }.forEach { key ->
+      pendingNotifyRequestByKey.remove(key)
     }
+    pendingDiscoverRequestByDeviceId.remove(deviceId)
   }
 
   private fun clearDeviceState(deviceId: String) {
     connectTokenByDeviceId.remove(deviceId)
-    connectLatchByDeviceId.remove(deviceId)
-    discoverLatchByDeviceId.remove(deviceId)
     serviceCacheByDeviceId.remove(deviceId)
     clearOperationStateForDevice(deviceId)
+  }
+
+  private fun clearPendingRequestLookup(requestId: String, deviceId: String, addressKey: String?) {
+    if (pendingDiscoverRequestByDeviceId[deviceId] == requestId) {
+      pendingDiscoverRequestByDeviceId.remove(deviceId)
+    }
+    if (addressKey != null) {
+      if (pendingReadRequestByKey[addressKey] == requestId) pendingReadRequestByKey.remove(addressKey)
+      if (pendingWriteRequestByKey[addressKey] == requestId) pendingWriteRequestByKey.remove(addressKey)
+      if (pendingNotifyRequestByKey[addressKey] == requestId) pendingNotifyRequestByKey.remove(addressKey)
+    }
+  }
+
+  private fun completePendingRequest(
+    requestId: String,
+    success: Boolean,
+    errorCode: String?,
+    errorMessage: String?,
+    payload: Any?
+  ) {
+    val pending = pendingGattByRequestId.remove(requestId) ?: return
+    pendingGattTimeoutByRequestId.remove(requestId)?.cancel(true)
+    clearPendingRequestLookup(requestId, pending.deviceId, pending.addressKey)
+    emitGattOperationResult(
+      requestId = requestId,
+      opName = pending.opName,
+      deviceId = pending.deviceId,
+      success = success,
+      errorCode = errorCode,
+      errorMessage = errorMessage,
+      payload = payload
+    )
+  }
+
+  private fun failPendingRequestsForDevice(deviceId: String, errorCode: String, errorMessage: String) {
+    val pending = pendingGattByRequestId.values.filter { it.deviceId == deviceId }
+    pending.forEach { request ->
+      completePendingRequest(request.requestId, false, errorCode, errorMessage, null)
+    }
   }
 
   private fun maybePruneScanCaches(now: Long) {
@@ -926,6 +1091,15 @@ class NitroBleScan : HybridNitroBleScanSpec() {
 
   private fun shutdownModuleResources() {
     if (!isShuttingDown.compareAndSet(false, true)) return
+    pendingGattByRequestId.keys.toList().forEach { requestId ->
+      completePendingRequest(
+        requestId,
+        success = false,
+        errorCode = "BLE_MODULE_DISPOSED",
+        errorMessage = "Module disposed while operation was pending.",
+        payload = null
+      )
+    }
     try {
       operationScheduler.shutdownNow()
     } catch (_: Throwable) {
@@ -936,6 +1110,11 @@ class NitroBleScan : HybridNitroBleScanSpec() {
       clearDeviceState(deviceId)
     }
     connectionStateByDeviceId.clear()
+    pendingGattTimeoutByRequestId.clear()
+    pendingDiscoverRequestByDeviceId.clear()
+    pendingReadRequestByKey.clear()
+    pendingWriteRequestByKey.clear()
+    pendingNotifyRequestByKey.clear()
   }
 
   private fun buildScanSettings(configJson: String): ScanSettings {
@@ -1202,7 +1381,7 @@ class NitroBleScan : HybridNitroBleScanSpec() {
 
   private fun nowMs(): Long = System.currentTimeMillis()
 
-  protected fun finalize() {
+  override fun dispose() {
     synchronized(stateLock) {
       try {
         scanCallback?.let { cb -> scanner?.stopScan(cb) }

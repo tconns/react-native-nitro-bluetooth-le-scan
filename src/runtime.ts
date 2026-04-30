@@ -3,6 +3,9 @@ import { getNitroBleScan } from './nitroInstance'
 import { eddystoneParser, iBeaconParser } from './parsers'
 import type {
   BleGattCharacteristicAddress,
+  BleGattOperationOptions,
+  BleGattOperationRequest,
+  BleGattOperationResult,
   BleGattService,
   BleScanAdapterState,
   BleScanConfig,
@@ -46,6 +49,14 @@ const parserRegistry = new Map<string, ManufacturerParser>([
 
 let lastConfig: BleScanConfig = {}
 const operationTailByDeviceId = new Map<string, Promise<unknown>>()
+const pendingGattByRequestId = new Map<
+  string,
+  {
+    resolve: (value: any) => void
+    reject: (reason?: unknown) => void
+    timeoutHandle: ReturnType<typeof setTimeout>
+  }
+>()
 
 const clamp = (value: number, min = 0, max = 1) =>
   Math.max(min, Math.min(max, value))
@@ -120,6 +131,55 @@ function parseJson<T>(value: string, fallback: T): T {
   }
 }
 
+function createRequestId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function resolveGattResult(result: BleGattOperationResult) {
+  const pending = pendingGattByRequestId.get(result.requestId)
+  if (pending == null) return
+  pendingGattByRequestId.delete(result.requestId)
+  clearTimeout(pending.timeoutHandle)
+  if (!result.success) {
+    pending.reject(
+      new Error(
+        result.errorMessage ??
+          result.errorCode ??
+          `${result.opName} failed for ${result.deviceId}`
+      )
+    )
+    return
+  }
+  if (result.opName === 'discoverServices') {
+    pending.resolve(result.services ?? [])
+    return
+  }
+  if (result.opName === 'readCharacteristic') {
+    pending.resolve(result.value ?? [])
+    return
+  }
+  pending.resolve(true)
+}
+
+function submitGattOperation<T>(
+  request: BleGattOperationRequest,
+  timeoutMs = 12000
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutHandle = setTimeout(() => {
+      if (!pendingGattByRequestId.has(request.requestId)) return
+      pendingGattByRequestId.delete(request.requestId)
+      reject(new Error(`${request.opName} timed out for ${request.deviceId}`))
+    }, timeoutMs)
+    pendingGattByRequestId.set(request.requestId, {resolve, reject, timeoutHandle})
+    const accepted = native.submitGattOperation(JSON.stringify(request))
+    if (accepted) return
+    pendingGattByRequestId.delete(request.requestId)
+    clearTimeout(timeoutHandle)
+    reject(new Error(`native rejected ${request.opName} for ${request.deviceId}`))
+  })
+}
+
 async function enqueueByDevice<T>(
   deviceId: string,
   operation: () => Promise<T>
@@ -144,6 +204,11 @@ function ensureListenerAttached() {
   native.setEventListener((eventJson) => {
     const event = parseJson<BleScanEvent | null>(eventJson, null)
     if (event == null || typeof event.type !== 'string') return
+    if (event.type === 'gattOperationResult') {
+      resolveGattResult(event.payload)
+      emitter.emit('event', event)
+      return
+    }
     if (event.type === 'deviceFound') {
       const enriched = applyParsers({
         ...event.payload,
@@ -197,25 +262,70 @@ export const bleScanManager: BleScanManager = {
   async disconnect(deviceId) {
     return enqueueByDevice(deviceId, async () => native.disconnect(deviceId))
   },
-  async discoverServices(deviceId) {
-    return enqueueByDevice(deviceId, async () =>
-      parseJson<BleGattService[]>(native.discoverServices(deviceId), [])
-    )
+  async discoverServices(deviceId, options: BleGattOperationOptions = {}) {
+    return enqueueByDevice(deviceId, async () => {
+      const requestId = createRequestId()
+      return submitGattOperation<BleGattService[]>(
+        {
+          requestId,
+          opName: 'discoverServices',
+          deviceId,
+          timeoutMs: options.timeoutMs,
+        },
+        options.timeoutMs ?? 12000
+      )
+    })
   },
-  async readCharacteristic(address) {
-    return enqueueByDevice(address.deviceId, async () =>
-      parseJson<number[]>(native.readCharacteristic(JSON.stringify(address)), [])
-    )
+  async readCharacteristic(address, options: BleGattOperationOptions = {}) {
+    return enqueueByDevice(address.deviceId, async () => {
+      const requestId = createRequestId()
+      return submitGattOperation<number[]>(
+        {
+          requestId,
+          opName: 'readCharacteristic',
+          deviceId: address.deviceId,
+          address,
+          timeoutMs: options.timeoutMs,
+        },
+        options.timeoutMs ?? 12000
+      )
+    })
   },
-  async writeCharacteristic(address, value) {
-    return enqueueByDevice(address.deviceId, async () =>
-      native.writeCharacteristic(JSON.stringify(address), JSON.stringify(value))
-    )
+  async writeCharacteristic(address, value, options: BleGattOperationOptions = {}) {
+    return enqueueByDevice(address.deviceId, async () => {
+      const requestId = createRequestId()
+      return submitGattOperation<boolean>(
+        {
+          requestId,
+          opName: 'writeCharacteristic',
+          deviceId: address.deviceId,
+          address,
+          value,
+          timeoutMs: options.timeoutMs,
+        },
+        options.timeoutMs ?? 12000
+      )
+    })
   },
-  async setCharacteristicNotification(address, enable) {
-    return enqueueByDevice(address.deviceId, async () =>
-      native.setCharacteristicNotification(JSON.stringify(address), enable)
-    )
+  async setCharacteristicNotification(
+    address,
+    enable,
+    options: BleGattOperationOptions = {}
+  ) {
+    return enqueueByDevice(address.deviceId, async () => {
+      const requestId = createRequestId()
+      return submitGattOperation<boolean>(
+        {
+          requestId,
+          opName: 'setCharacteristicNotification',
+          deviceId: address.deviceId,
+          address,
+          enable,
+          timeoutMs: options.timeoutMs,
+        },
+        options.timeoutMs ?? 12000
+      )
+    })
   },
   getSnapshot() {
     const snapshot = parseJson(native.getSnapshot(), FALLBACK_SNAPSHOT)
@@ -246,18 +356,24 @@ export const connectBleDevice = (
 ) => bleScanManager.connect(deviceId, options)
 export const disconnectBleDevice = (deviceId: string) =>
   bleScanManager.disconnect(deviceId)
-export const discoverBleServices = (deviceId: string) =>
-  bleScanManager.discoverServices(deviceId)
-export const readBleCharacteristic = (address: BleGattCharacteristicAddress) =>
-  bleScanManager.readCharacteristic(address)
+export const discoverBleServices = (
+  deviceId: string,
+  options?: BleGattOperationOptions
+) => bleScanManager.discoverServices(deviceId, options)
+export const readBleCharacteristic = (
+  address: BleGattCharacteristicAddress,
+  options?: BleGattOperationOptions
+) => bleScanManager.readCharacteristic(address, options)
 export const writeBleCharacteristic = (
   address: BleGattCharacteristicAddress,
-  value: number[]
-) => bleScanManager.writeCharacteristic(address, value)
+  value: number[],
+  options?: BleGattOperationOptions
+) => bleScanManager.writeCharacteristic(address, value, options)
 export const setBleCharacteristicNotification = (
   address: BleGattCharacteristicAddress,
-  enable: boolean
-) => bleScanManager.setCharacteristicNotification(address, enable)
+  enable: boolean,
+  options?: BleGattOperationOptions
+) => bleScanManager.setCharacteristicNotification(address, enable, options)
 export const getBleScanSnapshot = () => bleScanManager.getSnapshot()
 export const subscribeBleScan = (listener: (event: BleScanEvent) => void) =>
   bleScanManager.subscribe(listener)
@@ -268,4 +384,18 @@ export const registerManufacturerParser = (parser: ManufacturerParser) => {
 
 export const unregisterManufacturerParser = (parserId: string) => {
   parserRegistry.delete(parserId)
+}
+
+export const disposeBleRuntime = () => {
+  pendingGattByRequestId.forEach((pending, requestId) => {
+    clearTimeout(pending.timeoutHandle)
+    pending.reject(new Error(`runtime disposed while request pending: ${requestId}`))
+  })
+  pendingGattByRequestId.clear()
+  operationTailByDeviceId.clear()
+  try {
+    native.dispose()
+  } catch {
+    // best effort
+  }
 }
